@@ -8,20 +8,17 @@
 //! ```text
 //!  App thread (blocking)
 //!       │
-//!  Node::connect() / accept()
+//!  Node::connect() / listen() / accept()
 //!       │  rt.block_on(...)
 //!       ▼
 //!  tokio Runtime (owned by Node)
-//!       ├── ConnectHandle (Arc-cloned, &self connect)
-//!       └── Background accept task
-//!             owns mpsc::Receiver<Arc<Connection>>  ← no lock, no contention
-//!             spawns per-connection stream-accept tasks
-//!             pushes (Stream, pubkey) to Node::incoming_rx
+//!       ├── ConnectHandle (Arc-cloned, &self connect / listen)
+//!       └── Background accept loop per listen() port
 //! ```
 //!
-//! The connect side and accept side are fully decoupled:
+//! The connect side and listen side are fully decoupled:
 //! - Connect: cloneable `ConnectHandle` with `&self` — no blocking mutex.
-//! - Accept: exclusive ownership of the incoming-connection receiver — no lock needed.
+//! - Listen: per-port `Listener` with exclusive ownership of its receiver.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,13 +27,12 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
-use tracing::warn;
+use tokio::sync::Mutex as TokioMutex;
 
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 
-use crate::manager::ConnectHandle;
+use crate::manager::{ConnectHandle, Listener};
 use crate::stream::Stream;
 use crate::StreamManager;
 
@@ -50,6 +46,8 @@ pub struct Conn {
     stream: Arc<TokioMutex<Stream>>,
     /// Remote peer's 32-byte ed25519 public key.
     public_key: Vec<u8>,
+    /// The port this stream is on.
+    port: u16,
     rt: Arc<Runtime>,
 }
 
@@ -57,6 +55,11 @@ impl Conn {
     /// Remote peer's 32-byte ed25519 public key.
     pub fn public_key(&self) -> Vec<u8> {
         self.public_key.clone()
+    }
+
+    /// The port this stream is on.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Returns `true` while the stream is open.
@@ -136,7 +139,7 @@ impl Conn {
 // ── Node ─────────────────────────────────────────────────────────────────
 
 /// High-level Yggdrasil node — manages a full node and provides
-/// simple connect / accept / peer-management operations.
+/// simple connect / listen / accept / peer-management operations.
 ///
 /// Mirrors yggquic-new's `Node` API for easy Android integration.
 ///
@@ -146,8 +149,6 @@ pub struct Node {
     core: Arc<Core>,
     /// Connect-only handle (Arc-cloned, lock-free).
     handle: ConnectHandle,
-    /// Incoming (Stream, pubkey) pairs produced by the background accept loop.
-    incoming_rx: TokioMutex<mpsc::Receiver<(Stream, Vec<u8>)>>,
     rt: Arc<Runtime>,
 }
 
@@ -181,8 +182,7 @@ impl Node {
     fn from_key_and_config(signing_key: SigningKey, config: Config) -> Result<Self, String> {
         let rt = Arc::new(Runtime::new().map_err(|e| e.to_string())?);
 
-        // All async setup runs inside the runtime so tokio::spawn works correctly.
-        let (core, handle, incoming_rx) = rt.block_on(async {
+        let (core, handle) = rt.block_on(async {
             let core = Core::new(signing_key, config);
             core.init_links().await;
             core.start().await;
@@ -190,27 +190,15 @@ impl Node {
             // Brief pause so TCP handshakes with bootstrap peers can begin.
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            // Create the stream manager and split it immediately:
-            //   handle      → connect side (Arc-cloneable, &self)
-            //   incoming_rx → accept side  (exclusive ownership, no lock)
             let manager = StreamManager::new(core.packet_conn());
-            let (handle, conn_rx) = manager.split();
+            let handle = manager.split();
 
-            // Channel that the background task will push (Stream, pubkey) pairs into.
-            let (stream_tx, stream_rx) =
-                mpsc::channel::<(Stream, Vec<u8>)>(64);
-
-            // Background accept loop — owns conn_rx exclusively (no lock contention).
-            let handle_clone = handle.clone();
-            tokio::spawn(accept_loop(conn_rx, stream_tx, handle_clone));
-
-            (core, handle, stream_rx)
+            (core, handle)
         });
 
         Ok(Self {
             core,
             handle,
-            incoming_rx: TokioMutex::new(incoming_rx),
             rt,
         })
     }
@@ -224,11 +212,11 @@ impl Node {
 
     // ── connection API ────────────────────────────────────────────────────
 
-    /// Open a stream to the remote peer identified by its 32-byte public key.
+    /// Open a stream to the remote peer on the given port.
     ///
     /// Reuses an existing ironwood session if one exists; otherwise establishes
     /// a new one. Blocks until the stream handshake completes (≤ 30 s default).
-    pub fn connect(&self, public_key: &[u8]) -> Result<Conn, String> {
+    pub fn connect(&self, public_key: &[u8], port: u16) -> Result<Conn, String> {
         if public_key.len() != 32 {
             return Err("public_key must be exactly 32 bytes".to_string());
         }
@@ -240,28 +228,47 @@ impl Node {
 
         let stream = rt.block_on(async move {
             let connection = handle.connect(addr).await.map_err(|e| e.to_string())?;
-            connection.open_stream().await.map_err(|e| e.to_string())
+            connection.open_stream(port).await.map_err(|e| e.to_string())
         })?;
 
         Ok(Conn {
             stream: Arc::new(TokioMutex::new(stream)),
             public_key: public_key.to_vec(),
+            port,
             rt: self.rt.clone(),
         })
     }
 
-    /// Block until an incoming stream arrives and return it as a [`Conn`].
-    pub fn accept(&self) -> Result<Conn, String> {
-        let (stream, public_key) = self.rt.block_on(async {
-            let mut rx = self.incoming_rx.lock().await;
-            rx.recv().await.ok_or_else(|| "node closed".to_string())
+    /// Register a listener for the given port and block until an incoming stream arrives.
+    ///
+    /// This is a convenience that combines `listen` + single `accept`.
+    pub fn accept(&self, port: u16) -> Result<Conn, String> {
+        let handle = self.handle.clone();
+        let rt = self.rt.clone();
+
+        let (stream, public_key) = rt.block_on(async move {
+            let mut listener = handle.listen(port).await;
+            let stream = listener
+                .accept()
+                .await
+                .map_err(|e| e.to_string())?;
+            let public_key = stream.peer_addr().0.to_vec();
+            Ok::<_, String>((stream, public_key))
         })?;
 
         Ok(Conn {
             stream: Arc::new(TokioMutex::new(stream)),
             public_key,
+            port,
             rt: self.rt.clone(),
         })
+    }
+
+    /// Register a listener and return a [`Listener`] for continuous accept.
+    ///
+    /// The returned `Listener` can be used in a loop to accept many streams.
+    pub fn listen(&self, port: u16) -> Listener {
+        self.rt.block_on(self.handle.listen(port))
     }
 
     // ── peer management ───────────────────────────────────────────────────
@@ -373,36 +380,4 @@ impl Node {
             let _ = self.core.close().await;
         });
     }
-}
-
-// ── Background accept loop ────────────────────────────────────────────────────
-
-/// Continuously accepts connections from the exclusive receiver, then accepts
-/// streams from each connection and pushes them into `stream_tx`.
-///
-/// Owns `conn_rx` exclusively — no mutex, no lock contention with connect side.
-async fn accept_loop(
-    mut conn_rx: mpsc::Receiver<Arc<crate::Connection>>,
-    stream_tx: mpsc::Sender<(Stream, Vec<u8>)>,
-    _handle: ConnectHandle, // kept alive so the writer tasks can run
-) {
-    while let Some(connection) = conn_rx.recv().await {
-        let public_key = connection.peer_addr().0.to_vec();
-        let tx = stream_tx.clone();
-
-        // Spawn a per-connection task that accepts all streams from this peer.
-        tokio::spawn(async move {
-            loop {
-                match connection.accept_stream().await {
-                    Ok(stream) => {
-                        if tx.send((stream, public_key.clone())).await.is_err() {
-                            break; // Node dropped
-                        }
-                    }
-                    Err(_) => break, // connection closed
-                }
-            }
-        });
-    }
-    warn!("accept_loop: incoming connection receiver closed");
 }

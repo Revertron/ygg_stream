@@ -28,8 +28,11 @@ pub enum StreamState {
 /// Implements AsyncRead + AsyncWrite for standard Rust async I/O.
 #[derive(Clone)]
 pub struct Stream {
+    /// Port number
+    port: u16,
+
     /// Stream identifier
-    id: u32,
+    id: u16,
 
     /// Remote peer address (for debugging/logging)
     peer: Addr,
@@ -61,8 +64,9 @@ pub struct Stream {
 
 impl Stream {
     /// Create a new stream
-    pub fn new(id: u32, peer: Addr, outgoing: mpsc::Sender<Packet>) -> Self {
+    pub fn new(port: u16, id: u16, peer: Addr, outgoing: mpsc::Sender<Packet>) -> Self {
         Self {
+            port,
             id,
             peer,
             recv_buf: Arc::new(Mutex::new(VecDeque::new())),
@@ -77,8 +81,13 @@ impl Stream {
     }
 
     /// Get stream ID
-    pub fn id(&self) -> u32 {
+    pub fn id(&self) -> u16 {
         self.id
+    }
+
+    /// Get port number
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Get remote peer address
@@ -138,7 +147,7 @@ impl Stream {
                     drop(state);
 
                     // Send FIN to acknowledge
-                    let fin = Packet::fin(self.id);
+                    let fin = Packet::fin(self.port, self.id);
                     let _ = self.outgoing.send(fin).await;
 
                     return Ok(());
@@ -185,7 +194,7 @@ impl Stream {
     /// Send an ACK packet with current receive window
     async fn send_ack(&self) -> Result<()> {
         let window = self.recv_window.load(Ordering::Acquire);
-        let packet = Packet::ack(self.id, window);
+        let packet = Packet::ack(self.port, self.id, window);
         self.outgoing
             .send(packet)
             .await
@@ -195,7 +204,7 @@ impl Stream {
 
     /// Send a SYN packet to initiate the stream
     pub async fn send_syn(&self) -> Result<()> {
-        let packet = Packet::syn(self.id);
+        let packet = Packet::syn(self.port, self.id);
         self.outgoing
             .send(packet)
             .await
@@ -211,7 +220,7 @@ impl Stream {
         }
 
         *state = StreamState::Closed;
-        let packet = Packet::rst(self.id);
+        let packet = Packet::rst(self.port, self.id);
         let _ = self.outgoing.send(packet).await;
 
         self.read_notify.notify_waiters();
@@ -237,7 +246,7 @@ impl Stream {
         }
 
         *state = StreamState::Closing;
-        let packet = Packet::fin(self.id);
+        let packet = Packet::fin(self.port, self.id);
         self.outgoing
             .send(packet)
             .await
@@ -368,7 +377,7 @@ impl AsyncWrite for Stream {
         let to_send = std::cmp::min(buf.len(), window);
         let data = buf[..to_send].to_vec();
         let window_after = this.recv_window.load(Ordering::Acquire);
-        let packet = Packet::data_ack(this.id, data, window_after);
+        let packet = Packet::data_ack(this.port, this.id, data, window_after);
 
         // Decrease send window
         this.send_window.fetch_sub(to_send, Ordering::Release);
@@ -401,7 +410,7 @@ impl AsyncWrite for Stream {
                     drop(guard);
 
                     // Send FIN packet
-                    let packet = Packet::fin(this.id);
+                    let packet = Packet::fin(this.port, this.id);
                     let outgoing = this.outgoing.clone();
                     tokio::spawn(async move {
                         let _ = outgoing.send(packet).await;
@@ -438,9 +447,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream_creation() {
         let (tx, _rx) = mpsc::channel(10);
-        let stream = Stream::new(1, Addr::from([0u8; 32]), tx);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
 
         assert_eq!(stream.id(), 1);
+        assert_eq!(stream.port(), 1);
         assert_eq!(stream.state().await, StreamState::Opening);
         assert_eq!(stream.peer_addr(), Addr::from([0u8; 32]));
     }
@@ -448,13 +458,13 @@ mod tests {
     #[tokio::test]
     async fn test_stream_state_transitions() {
         let (tx, _rx) = mpsc::channel(10);
-        let stream = Stream::new(1, Addr::from([0u8; 32]), tx);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
 
         // Initial state
         assert_eq!(stream.state().await, StreamState::Opening);
 
         // Receive SYN-ACK -> Open
-        let syn_ack = Packet::syn_ack(1);
+        let syn_ack = Packet::syn_ack(1, 1);
         stream.handle_packet(syn_ack).await.unwrap();
         assert_eq!(stream.state().await, StreamState::Open);
 
@@ -478,10 +488,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream_abort() {
         let (tx, mut rx) = mpsc::channel(10);
-        let stream = Stream::new(1, Addr::from([0u8; 32]), tx);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
 
         // Transition to Open first
-        let syn_ack = Packet::syn_ack(1);
+        let syn_ack = Packet::syn_ack(1, 1);
         stream.handle_packet(syn_ack).await.unwrap();
 
         // Abort stream
@@ -497,14 +507,14 @@ mod tests {
     #[tokio::test]
     async fn test_stream_data_delivery() {
         let (tx, _rx) = mpsc::channel(10);
-        let stream = Stream::new(1, Addr::from([0u8; 32]), tx);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
 
         // Transition to Open
-        let syn_ack = Packet::syn_ack(1);
+        let syn_ack = Packet::syn_ack(1, 1);
         stream.handle_packet(syn_ack).await.unwrap();
 
         // Deliver data
-        let data_packet = Packet::data(1, b"hello".to_vec());
+        let data_packet = Packet::data(1, 1, b"hello".to_vec());
         stream.handle_packet(data_packet).await.unwrap();
 
         // Check recv_buf has data
@@ -517,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_flow_control() {
         let (tx, _rx) = mpsc::channel(10);
-        let stream = Stream::new(1, Addr::from([0u8; 32]), tx);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
 
         // Initial send window
         assert_eq!(
@@ -527,6 +537,7 @@ mod tests {
 
         // Receive ACK with new window
         let ack = Packet {
+            port: 1,
             stream_id: 1,
             flags: FLAG_ACK | FLAG_SYN,
             data: Vec::new(),
@@ -541,15 +552,15 @@ mod tests {
     #[tokio::test]
     async fn test_stream_reset_on_rst() {
         let (tx, _rx) = mpsc::channel(10);
-        let stream = Stream::new(1, Addr::from([0u8; 32]), tx);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
 
         // Transition to Open
-        let syn_ack = Packet::syn_ack(1);
+        let syn_ack = Packet::syn_ack(1, 1);
         stream.handle_packet(syn_ack).await.unwrap();
         assert_eq!(stream.state().await, StreamState::Open);
 
         // Receive RST
-        let rst = Packet::rst(1);
+        let rst = Packet::rst(1, 1);
         let result = stream.handle_packet(rst).await;
         assert!(matches!(result, Err(Error::StreamReset)));
         assert_eq!(stream.state().await, StreamState::Closed);

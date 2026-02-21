@@ -63,7 +63,7 @@ pub mod stream;
 // Re-export main types
 pub use connection::Connection;
 pub use error::{Error, Result};
-pub use manager::{ConnectHandle, StreamManager};
+pub use manager::{ConnectHandle, Listener, StreamManager};
 pub use node::{Conn, Node};
 pub use protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_PACKET_SIZE};
 pub use stream::{Stream, StreamState};

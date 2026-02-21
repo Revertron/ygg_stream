@@ -5,6 +5,7 @@ A lightweight stream multiplexing library built on top of ironwood's encrypted P
 ## Features
 
 - **Multiple concurrent streams** per peer connection
+- **Port-based service routing** - multiple services on a single node (e.g., chat on port 1, file transfer on port 2)
 - **Stream-oriented API** - continuous byte streams with AsyncRead + AsyncWrite
 - **No additional encryption** - leverages Yggdrasil's existing encryption at PacketConn layer
 - **Simple custom protocol** - optimized for PacketConn semantics (7-byte header overhead)
@@ -16,7 +17,7 @@ A lightweight stream multiplexing library built on top of ironwood's encrypted P
 ```
 Application
     ↓
-ygg_stream (stream multiplexing)
+ygg_stream (stream multiplexing + port routing)
     ↓
 ironwood (encrypted PacketConn)
 ```
@@ -25,7 +26,7 @@ ironwood (encrypted PacketConn)
 
 **Packet Format** (7 bytes + data):
 ```
-[stream_id: u32][flags: u8][length: u16][data: bytes]
+[port:u16][stream_id:u16][flags: u8][length: u16][data: bytes]
 ```
 
 **Flags**:
@@ -35,11 +36,16 @@ ironwood (encrypted PacketConn)
 - `RST (0x08)`: Reset stream (immediate close)
 
 **Stream Lifecycle**:
-1. **SYN**: Initiator opens stream
-2. **SYN-ACK**: Acceptor responds
+1. **SYN**: Initiator opens stream on a port
+2. **SYN-ACK**: Acceptor responds (if a listener is registered for the port)
 3. **DATA**: Bidirectional data transfer with ACK
 4. **FIN**: Graceful close (both sides send FIN)
-5. **RST**: Immediate close (error or abort)
+5. **RST**: Immediate close (error, abort, or no listener on port)
+
+**Port Routing**:
+- Each node registers listeners on specific ports via `listen(port)`
+- Incoming SYN packets for ports without a listener receive an RST
+- Different services bind different ports, each with their own accept channel
 
 **Stream ID Allocation**:
 - Initiator uses **odd IDs** (1, 3, 5, ...)
@@ -48,7 +54,8 @@ ironwood (encrypted PacketConn)
 
 ## Integration with Yggdrasil
 
-The `ygg_stream` library is designed to work seamlessly with a complete Yggdrasil node. The Yggdrasil `Core` handles all network transport (TCP/TLS listeners and peer connections), while `ygg_stream` provides stream multiplexing on top.
+The `ygg_stream` library is designed to work seamlessly with a complete Yggdrasil node.
+The Yggdrasil `Core` handles all network transport (TCP/TLS listeners and peer connections), while `ygg_stream` provides stream multiplexing on top.
 
 ### Complete Node Example
 
@@ -57,6 +64,9 @@ use ed25519_dalek::SigningKey;
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 use ygg_stream::StreamManager;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const MY_SERVICE_PORT: u16 = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,11 +84,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     core.start().await;  // Starts TCP listeners and connects to peers
 
     // Create stream manager on top of Yggdrasil core
-    let mut stream_manager = StreamManager::new(core.packet_conn());
+    let stream_manager = StreamManager::new(core.packet_conn());
 
-    // Now use stream multiplexing
-    let connection = stream_manager.accept().await?;
-    let mut stream = connection.accept_stream().await?;
+    // Register a listener on our service port
+    let mut listener = stream_manager.listen(MY_SERVICE_PORT).await;
+
+    // Accept incoming streams on this port
+    let mut stream = listener.accept().await?;
 
     // Use standard async I/O
     let mut buf = vec![0u8; 1024];
@@ -99,31 +111,29 @@ use ironwood::{new_encrypted_packet_conn, PacketConn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ygg_stream::StreamManager;
 
+const ECHO_PORT: u16 = 1;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create ironwood node
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let conn = new_encrypted_packet_conn(signing_key, Default::default());
 
-    // Create stream manager
-    let mut manager = StreamManager::new(conn);
+    // Create stream manager and listen on a port
+    let manager = StreamManager::new(conn);
+    let mut listener = manager.listen(ECHO_PORT).await;
 
-    // Accept connections
+    // Accept streams
     loop {
-        let connection = manager.accept().await?;
+        let mut stream = listener.accept().await?;
         tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
             loop {
-                let mut stream = connection.accept_stream().await?;
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1024];
-                    loop {
-                        let n = stream.read(&mut buf).await?;
-                        if n == 0 { break; }
-                        stream.write_all(&buf[..n]).await?;
-                    }
-                    Ok::<_, Box<dyn std::error::Error>>(())
-                });
+                let n = stream.read(&mut buf).await?;
+                if n == 0 { break; }
+                stream.write_all(&buf[..n]).await?;
             }
+            Ok::<_, Box<dyn std::error::Error>>(())
         });
     }
 }
@@ -137,19 +147,19 @@ use ironwood::{new_encrypted_packet_conn, Addr, PacketConn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ygg_stream::StreamManager;
 
+const ECHO_PORT: u16 = 1;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let conn = new_encrypted_packet_conn(signing_key, Default::default());
 
-    let mut manager = StreamManager::new(conn);
+    let manager = StreamManager::new(conn);
 
-    // Connect to peer
+    // Connect to peer and open a stream on the echo port
     let peer_key: [u8; 32] = /* peer's public key */;
     let connection = manager.connect(Addr::from(peer_key)).await?;
-
-    // Open stream
-    let mut stream = connection.open_stream().await?;
+    let mut stream = connection.open_stream(ECHO_PORT).await?;
 
     // Send/receive data
     stream.write_all(b"Hello, Yggdrasil!").await?;
@@ -162,15 +172,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Multiple Services on One Node
+
+```rust
+const CHAT_PORT: u16 = 1;
+const FILE_PORT: u16 = 2;
+
+let manager = StreamManager::new(conn);
+
+// Each service gets its own listener
+let mut chat_listener = manager.listen(CHAT_PORT).await;
+let mut file_listener = manager.listen(FILE_PORT).await;
+
+// Handle each service independently
+tokio::spawn(async move {
+    loop {
+        let stream = chat_listener.accept().await?;
+        // handle chat stream...
+    }
+});
+
+tokio::spawn(async move {
+    loop {
+        let stream = file_listener.accept().await?;
+        // handle file transfer stream...
+    }
+});
+```
+
 ### Multiple Concurrent Streams
 
 ```rust
 let connection = manager.connect(peer_addr).await?;
 
-// Open multiple streams
-let mut stream1 = connection.open_stream().await?;
-let mut stream2 = connection.open_stream().await?;
-let mut stream3 = connection.open_stream().await?;
+// Open multiple streams on the same port
+let mut stream1 = connection.open_stream(1).await?;
+let mut stream2 = connection.open_stream(1).await?;
+let mut stream3 = connection.open_stream(1).await?;
 
 // Use streams independently in parallel
 tokio::spawn(async move {
@@ -201,7 +239,7 @@ cargo run -p ygg_stream --example full_node --features full-node client tcp://12
 This example demonstrates:
 - Complete Yggdrasil node with TCP transport
 - Automatic peer connection management
-- Stream multiplexing on top of Yggdrasil
+- Stream multiplexing with port-based routing
 - Bidirectional communication
 
 ### Echo Server (standalone, for testing)
@@ -220,22 +258,29 @@ cargo run -p ygg_stream --example client <peer_public_key_hex>
 
 1. **StreamManager** (`manager.rs`)
    - Manages connections and stream multiplexing per peer
-   - Background reader task demultiplexes packets to connections
+   - Per-port `Listener` channels for service routing
+   - Background reader task demultiplexes packets to connections and port listeners
    - Background writer tasks aggregate packets from streams
+   - Sends RST for incoming streams on ports without a listener
 
-2. **Connection** (`connection.rs`)
+2. **Listener** (`manager.rs`)
+   - Per-port accept channel returned by `listen(port)`
+   - `accept()` yields incoming streams on that port
+
+3. **Connection** (`connection.rs`)
    - Represents multiplexed connection to single peer
-   - Manages multiple streams
+   - Manages multiple streams keyed by (port, stream_id)
    - Stream ID allocation (odd/even separation)
 
-3. **Stream** (`stream.rs`)
-   - Individual bidirectional stream
+4. **Stream** (`stream.rs`)
+   - Individual bidirectional stream with port and stream_id
    - Implements `AsyncRead` + `AsyncWrite`
    - Flow control with send/receive windows
    - State machine: Opening → Open → Closing → Closed
 
-4. **Protocol** (`protocol.rs`)
+5. **Protocol** (`protocol.rs`)
    - Packet encoding/decoding
+   - Port + stream_id packed into a single u32 on the wire
    - Protocol constants and flags
 
 ### Flow Control
@@ -265,6 +310,7 @@ cargo test -p ygg_stream
 Integration tests demonstrate:
 - Bidirectional communication
 - Multiple concurrent streams
+- Port-based stream routing
 - Stream ID allocation
 - Connection lifecycle
 
@@ -296,8 +342,9 @@ Potential additions (not currently implemented):
 
 ## License
 
-LGPL-3.0 (matching Yggdrasil project)
+This project is licensed under the **Mozilla Public License 2.0 (MPL-2.0)** as the `ironwood`. See the [LICENSE](LICENSE) file for the full license text.
 
 ## Contributing
 
-This is part of the Yggdrasil-ng Rust rewrite project. See main project README for contribution guidelines.
+Contributions are not very welcome! Please don't feel free to submit issues or pull requests.
+Ensure your code follows the project's own style guidelines and passes all tests.

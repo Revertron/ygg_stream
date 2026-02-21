@@ -8,6 +8,9 @@ use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 use ygg_stream::StreamManager;
 
+/// Default port used in tests
+const TEST_PORT: u16 = 1;
+
 /// Helper to create a Yggdrasil node with TCP listener on a specific port
 async fn create_node_with_listener(port: u16) -> Arc<Core> {
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
@@ -61,17 +64,24 @@ async fn test_tcp_connectivity_and_streams() {
     let peer_uri = format!("tcp://127.0.0.1:{}", port1);
     let core2 = create_node_with_peer(&peer_uri).await;
 
-    let mut manager1 = StreamManager::new(core1.packet_conn());
+    let manager1 = StreamManager::new(core1.packet_conn());
     let manager2 = StreamManager::new(core2.packet_conn());
 
-    // open_stream() sends SYN every 500ms and blocks until SYN-ACK is received.
-    // By the time it returns, manager1 already has the connection queued.
-    let connection2 = manager2.connect(addr1).await.unwrap();
-    let mut stream2 = connection2.open_stream().await.unwrap();
+    // Register a listener on manager1 for TEST_PORT
+    let mut listener1 = manager1.listen(TEST_PORT).await;
 
-    // Connection is guaranteed to be in the accept queue now
-    let connection1 = manager1.accept().await.unwrap();
-    let mut stream1 = connection1.accept_stream().await.unwrap();
+    // open_stream() sends SYN every 500ms and blocks until SYN-ACK is received.
+    let connection2 = manager2.connect(addr1).await.unwrap();
+    let mut stream2 = connection2.open_stream(TEST_PORT).await.unwrap();
+
+    // Accept the incoming stream on node 1 via the listener
+    let mut stream1 = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        listener1.accept()
+    )
+    .await
+    .expect("Timeout accepting stream on node 1")
+    .unwrap();
 
     // Bidirectional data transfer
     let msg_a = b"Hello from node 2!";
@@ -129,11 +139,14 @@ async fn test_tcp_multiple_streams() {
     let manager1 = StreamManager::new(core1.packet_conn());
     let manager2 = StreamManager::new(core2.packet_conn());
 
+    // Register a listener so SYNs are accepted
+    let _listener1 = manager1.listen(TEST_PORT).await;
+
     let connection2 = manager2.connect(addr1).await.unwrap();
 
-    let stream1 = connection2.open_stream().await.unwrap();
-    let stream2 = connection2.open_stream().await.unwrap();
-    let stream3 = connection2.open_stream().await.unwrap();
+    let stream1 = connection2.open_stream(TEST_PORT).await.unwrap();
+    let stream2 = connection2.open_stream(TEST_PORT).await.unwrap();
+    let stream3 = connection2.open_stream(TEST_PORT).await.unwrap();
 
     // Verify stream IDs are unique and odd (node 2 is the initiator)
     assert_ne!(stream1.id(), stream2.id());
@@ -163,17 +176,39 @@ async fn test_tcp_bidirectional_multiple_streams() {
     let peer_uri = format!("tcp://127.0.0.1:{}", port1);
     let core2 = create_node_with_peer(&peer_uri).await;
 
-    let mut manager1 = StreamManager::new(core1.packet_conn());
+    let manager1 = StreamManager::new(core1.packet_conn());
     let manager2 = StreamManager::new(core2.packet_conn());
 
-    // Node 2 opens a stream to node 1. When open_stream() returns, the connection
-    // is guaranteed to be in manager1's accept queue.
-    let connection2 = manager2.connect(addr1).await.unwrap();
-    let mut stream_2to1 = connection2.open_stream().await.unwrap();
+    // Both sides listen on TEST_PORT
+    let mut listener1 = manager1.listen(TEST_PORT).await;
+    let mut listener2 = manager2.listen(TEST_PORT).await;
 
-    // Accept the connection on node 1 and open a stream back to node 2.
-    let connection1 = manager1.accept().await.unwrap();
-    let mut stream_1to2 = connection1.open_stream().await.unwrap();
+    // Node 2 opens a stream to node 1
+    let connection2 = manager2.connect(addr1).await.unwrap();
+    let mut stream_2to1 = connection2.open_stream(TEST_PORT).await.unwrap();
+
+    // Accept the stream on node 1 via listener
+    let mut stream_from_2 = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        listener1.accept()
+    )
+    .await
+    .expect("Timeout accepting stream on node 1")
+    .unwrap();
+
+    // Node 1 opens a stream back to node 2 (reuses existing connection)
+    let addr2 = core2.packet_conn().local_addr();
+    let connection1 = manager1.connect(addr2).await.unwrap();
+    let mut stream_1to2 = connection1.open_stream(TEST_PORT).await.unwrap();
+
+    // Accept the stream from node 1 on node 2 via listener
+    let mut stream_from_1 = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        listener2.accept()
+    )
+    .await
+    .expect("Timeout accepting stream on node 2")
+    .unwrap();
 
     // Send data in both directions
     let msg1 = b"Message from node 1";
@@ -183,23 +218,6 @@ async fn test_tcp_bidirectional_multiple_streams() {
     stream_1to2.flush().await.unwrap();
     stream_2to1.write_all(msg2).await.unwrap();
     stream_2to1.flush().await.unwrap();
-
-    // Accept the incoming streams on each side
-    let mut stream_from_2 = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
-        connection1.accept_stream()
-    )
-    .await
-    .expect("Timeout accepting stream on node 1")
-    .unwrap();
-
-    let mut stream_from_1 = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
-        connection2.accept_stream()
-    )
-    .await
-    .expect("Timeout accepting stream on node 2")
-    .unwrap();
 
     // Verify data arrived
     let mut buf = vec![0u8; 1024];

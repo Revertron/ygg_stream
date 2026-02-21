@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 use ygg_stream::StreamManager;
 
+/// Default port for the echo service
+const ECHO_PORT: u16 = 1;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -50,9 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = manager.connect(peer_addr).await?;
     info!("Connected to peer");
 
-    // Open a stream
-    let mut stream = connection.open_stream().await?;
-    info!("Opened stream {}", stream.id());
+    // Open a stream on the echo port
+    let mut stream = connection.open_stream(ECHO_PORT).await?;
+    info!("Opened stream {} on port {}", stream.id(), stream.port());
 
     // Send a message
     let message = b"Hello, Yggdrasil!";

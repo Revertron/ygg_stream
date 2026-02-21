@@ -65,18 +65,18 @@ impl FfiNode {
         self.0.public_key()
     }
 
-    /// Open a stream to the peer identified by its 32-byte public key.
-    pub fn connect(&self, public_key: Vec<u8>) -> Result<Arc<FfiConn>, YggError> {
+    /// Open a stream to the peer identified by its 32-byte public key on the given port.
+    pub fn connect(&self, public_key: Vec<u8>, port: u16) -> Result<Arc<FfiConn>, YggError> {
         self.0
-            .connect(&public_key)
+            .connect(&public_key, port)
             .map(|c| Arc::new(FfiConn(c)))
             .map_err(YggError::Generic)
     }
 
-    /// Block until an incoming stream arrives.
-    pub fn accept(&self) -> Result<Arc<FfiConn>, YggError> {
+    /// Block until an incoming stream arrives on the given port.
+    pub fn accept(&self, port: u16) -> Result<Arc<FfiConn>, YggError> {
         self.0
-            .accept()
+            .accept(port)
             .map(|c| Arc::new(FfiConn(c)))
             .map_err(YggError::Generic)
     }
@@ -138,6 +138,11 @@ impl FfiConn {
     /// Remote peer's 32-byte ed25519 public key.
     pub fn public_key(&self) -> Vec<u8> {
         self.0.public_key()
+    }
+
+    /// The port this stream is on.
+    pub fn port(&self) -> u16 {
+        self.0.port()
     }
 
     /// Returns `true` while the stream is open.

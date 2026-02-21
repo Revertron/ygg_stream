@@ -29,11 +29,15 @@ pub enum Error {
 
     /// Invalid stream ID
     #[error("Invalid stream ID: {0}")]
-    InvalidStreamId(u32),
+    InvalidStreamId(u16),
 
     /// Stream already exists
-    #[error("Stream already exists: {0}")]
-    StreamExists(u32),
+    #[error("Stream already exists: port={0} stream_id={1}")]
+    StreamExists(u16, u16),
+
+    /// No listener registered for port
+    #[error("No listener for port {0}")]
+    PortNotListened(u16),
 
     /// Packet too large
     #[error("Packet too large: {0} bytes (max {1})")]

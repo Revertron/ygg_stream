@@ -8,6 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
 use ygg_stream::StreamManager;
 
+/// Default port for the echo service
+const ECHO_PORT: u16 = 1;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -24,41 +27,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Local address: {}", local_addr);
 
     // Create stream manager
-    let mut manager = StreamManager::new(conn);
+    let manager = StreamManager::new(conn);
 
-    info!("Waiting for connections...");
+    // Register a listener on the echo port
+    let mut listener = manager.listen(ECHO_PORT).await;
 
-    // Accept connections in a loop
+    info!("Listening on port {} for connections...", ECHO_PORT);
+
+    // Accept streams in a loop
     loop {
-        match manager.accept().await {
-            Ok(connection) => {
-                let peer = connection.peer_addr();
-                info!("Accepted connection from peer {}", peer);
+        match listener.accept().await {
+            Ok(stream) => {
+                let peer = stream.peer_addr();
+                info!("Accepted stream {} on port {} from peer {}", stream.id(), stream.port(), peer);
 
-                // Spawn a task to handle this connection
+                // Spawn a task to handle this stream
                 tokio::spawn(async move {
-                    loop {
-                        match connection.accept_stream().await {
-                            Ok(stream) => {
-                                info!("Accepted stream {} from peer {}", stream.id(), peer);
-
-                                // Spawn a task to handle this stream
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle_stream(stream).await {
-                                        error!("Stream error: {}", e);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("Error accepting stream: {}", e);
-                                break;
-                            }
-                        }
+                    if let Err(e) = handle_stream(stream).await {
+                        error!("Stream error: {}", e);
                     }
                 });
             }
             Err(e) => {
-                error!("Error accepting connection: {}", e);
+                error!("Error accepting stream: {}", e);
                 break;
             }
         }

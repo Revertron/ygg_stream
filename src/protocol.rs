@@ -23,12 +23,17 @@ pub const HEADER_SIZE: usize = 7;
 ///
 /// Wire format:
 /// ```text
-/// [stream_id: u32][flags: u8][length: u16][data: bytes]
+/// [port:u16 << 16 | stream_id:u16 : u32][flags: u8][length: u16][data: bytes]
 /// ```
+///
+/// The 4-byte combined field encodes `(port << 16) | stream_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
-    /// Stream identifier
-    pub stream_id: u32,
+    /// Port number (high 16 bits of the wire u32)
+    pub port: u16,
+
+    /// Stream identifier (low 16 bits of the wire u32)
+    pub stream_id: u16,
 
     /// Control flags (SYN, ACK, FIN, RST)
     pub flags: u8,
@@ -43,8 +48,9 @@ pub struct Packet {
 
 impl Packet {
     /// Create a new packet
-    pub fn new(stream_id: u32, flags: u8, data: Vec<u8>) -> Self {
+    pub fn new(port: u16, stream_id: u16, flags: u8, data: Vec<u8>) -> Self {
         Self {
+            port,
             stream_id,
             flags,
             data,
@@ -53,23 +59,24 @@ impl Packet {
     }
 
     /// Create a SYN packet to open a stream
-    pub fn syn(stream_id: u32) -> Self {
-        Self::new(stream_id, FLAG_SYN, Vec::new())
+    pub fn syn(port: u16, stream_id: u16) -> Self {
+        Self::new(port, stream_id, FLAG_SYN, Vec::new())
     }
 
     /// Create a SYN-ACK packet
-    pub fn syn_ack(stream_id: u32) -> Self {
-        Self::new(stream_id, FLAG_SYN | FLAG_ACK, Vec::new())
+    pub fn syn_ack(port: u16, stream_id: u16) -> Self {
+        Self::new(port, stream_id, FLAG_SYN | FLAG_ACK, Vec::new())
     }
 
     /// Create a data packet
-    pub fn data(stream_id: u32, data: Vec<u8>) -> Self {
-        Self::new(stream_id, 0, data)
+    pub fn data(port: u16, stream_id: u16, data: Vec<u8>) -> Self {
+        Self::new(port, stream_id, 0, data)
     }
 
     /// Create a data + ACK packet
-    pub fn data_ack(stream_id: u32, data: Vec<u8>, window: usize) -> Self {
+    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, window: usize) -> Self {
         Self {
+            port,
             stream_id,
             flags: FLAG_ACK,
             data,
@@ -78,18 +85,19 @@ impl Packet {
     }
 
     /// Create a FIN packet to close a stream
-    pub fn fin(stream_id: u32) -> Self {
-        Self::new(stream_id, FLAG_FIN, Vec::new())
+    pub fn fin(port: u16, stream_id: u16) -> Self {
+        Self::new(port, stream_id, FLAG_FIN, Vec::new())
     }
 
     /// Create a RST packet to reset a stream
-    pub fn rst(stream_id: u32) -> Self {
-        Self::new(stream_id, FLAG_RST, Vec::new())
+    pub fn rst(port: u16, stream_id: u16) -> Self {
+        Self::new(port, stream_id, FLAG_RST, Vec::new())
     }
 
     /// Create an ACK packet with window update
-    pub fn ack(stream_id: u32, window: usize) -> Self {
+    pub fn ack(port: u16, stream_id: u16, window: usize) -> Self {
         Self {
+            port,
             stream_id,
             flags: FLAG_ACK,
             data: Vec::new(),
@@ -119,7 +127,7 @@ impl Packet {
 
     /// Encode packet to bytes
     ///
-    /// Format: [stream_id: u32][flags: u8][length: u16][data]
+    /// Format: [(port << 16 | stream_id): u32][flags: u8][length: u16][data]
     pub fn encode(&self) -> Result<Vec<u8>> {
         let data_len = self.data.len();
         if data_len > MAX_DATA_SIZE {
@@ -128,8 +136,9 @@ impl Packet {
 
         let mut buf = BytesMut::with_capacity(HEADER_SIZE + data_len);
 
-        // Write stream ID (4 bytes, big-endian)
-        buf.put_u32(self.stream_id);
+        // Write combined port + stream_id (4 bytes, big-endian)
+        let combined = ((self.port as u32) << 16) | (self.stream_id as u32);
+        buf.put_u32(combined);
 
         // Write flags (1 byte)
         buf.put_u8(self.flags);
@@ -155,8 +164,10 @@ impl Packet {
 
         let mut cursor = std::io::Cursor::new(buf);
 
-        // Read stream ID (4 bytes, big-endian)
-        let stream_id = cursor.get_u32();
+        // Read combined port + stream_id (4 bytes, big-endian)
+        let combined = cursor.get_u32();
+        let port = (combined >> 16) as u16;
+        let stream_id = (combined & 0xFFFF) as u16;
 
         // Read flags (1 byte)
         let flags = cursor.get_u8();
@@ -177,6 +188,7 @@ impl Packet {
         let data = buf[HEADER_SIZE..].to_vec();
 
         Ok(Self {
+            port,
             stream_id,
             flags,
             data,
@@ -191,18 +203,36 @@ mod tests {
 
     #[test]
     fn test_packet_encode_decode() {
-        let packet = Packet::new(42, FLAG_SYN | FLAG_ACK, b"hello".to_vec());
+        let packet = Packet::new(5, 42, FLAG_SYN | FLAG_ACK, b"hello".to_vec());
         let encoded = packet.encode().unwrap();
         let decoded = Packet::decode(&encoded).unwrap();
 
+        assert_eq!(decoded.port, 5);
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.flags, FLAG_SYN | FLAG_ACK);
         assert_eq!(decoded.data, b"hello");
     }
 
     #[test]
+    fn test_packet_port_stream_id_encoding() {
+        // Verify the combined encoding: (port << 16) | stream_id
+        let packet = Packet::syn(0x1234, 0xABCD);
+        let encoded = packet.encode().unwrap();
+        // First 4 bytes should be 0x1234ABCD
+        assert_eq!(encoded[0], 0x12);
+        assert_eq!(encoded[1], 0x34);
+        assert_eq!(encoded[2], 0xAB);
+        assert_eq!(encoded[3], 0xCD);
+
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.port, 0x1234);
+        assert_eq!(decoded.stream_id, 0xABCD);
+    }
+
+    #[test]
     fn test_packet_syn() {
-        let packet = Packet::syn(123);
+        let packet = Packet::syn(1, 123);
+        assert_eq!(packet.port, 1);
         assert_eq!(packet.stream_id, 123);
         assert!(packet.is_syn());
         assert!(!packet.is_ack());
@@ -213,7 +243,8 @@ mod tests {
 
     #[test]
     fn test_packet_syn_ack() {
-        let packet = Packet::syn_ack(456);
+        let packet = Packet::syn_ack(2, 456);
+        assert_eq!(packet.port, 2);
         assert_eq!(packet.stream_id, 456);
         assert!(packet.is_syn());
         assert!(packet.is_ack());
@@ -223,7 +254,8 @@ mod tests {
 
     #[test]
     fn test_packet_data() {
-        let packet = Packet::data(789, b"test data".to_vec());
+        let packet = Packet::data(3, 789, b"test data".to_vec());
+        assert_eq!(packet.port, 3);
         assert_eq!(packet.stream_id, 789);
         assert!(!packet.is_syn());
         assert!(!packet.is_ack());
@@ -234,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_packet_fin() {
-        let packet = Packet::fin(111);
+        let packet = Packet::fin(1, 111);
         assert_eq!(packet.stream_id, 111);
         assert!(packet.is_fin());
         assert!(!packet.is_syn());
@@ -244,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_packet_rst() {
-        let packet = Packet::rst(222);
+        let packet = Packet::rst(1, 222);
         assert_eq!(packet.stream_id, 222);
         assert!(packet.is_rst());
         assert!(!packet.is_syn());
@@ -255,7 +287,7 @@ mod tests {
     #[test]
     fn test_packet_too_large() {
         let data = vec![0u8; MAX_DATA_SIZE + 1];
-        let packet = Packet::new(1, 0, data);
+        let packet = Packet::new(0, 1, 0, data);
         assert!(matches!(
             packet.encode(),
             Err(Error::PacketTooLarge(_, _))
@@ -266,7 +298,7 @@ mod tests {
     fn test_decode_invalid_length() {
         // Create packet with mismatched length field
         let mut buf = BytesMut::new();
-        buf.put_u32(1); // stream_id
+        buf.put_u32(1); // combined port+stream_id
         buf.put_u8(0); // flags
         buf.put_u16(100); // length says 100 bytes
         buf.put_slice(b"short"); // but only 5 bytes of data
@@ -289,10 +321,11 @@ mod tests {
     #[test]
     fn test_packet_with_large_data() {
         let data = vec![0xAB; 1000];
-        let packet = Packet::data(999, data.clone());
+        let packet = Packet::data(10, 999, data.clone());
         let encoded = packet.encode().unwrap();
         let decoded = Packet::decode(&encoded).unwrap();
 
+        assert_eq!(decoded.port, 10);
         assert_eq!(decoded.stream_id, 999);
         assert_eq!(decoded.data.len(), 1000);
         assert_eq!(decoded.data, data);
@@ -300,13 +333,23 @@ mod tests {
 
     #[test]
     fn test_packet_empty_data() {
-        let packet = Packet::new(1, FLAG_ACK, Vec::new());
+        let packet = Packet::new(1, 1, FLAG_ACK, Vec::new());
         let encoded = packet.encode().unwrap();
         assert_eq!(encoded.len(), HEADER_SIZE);
 
         let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.port, 1);
         assert_eq!(decoded.stream_id, 1);
         assert!(decoded.is_ack());
         assert!(decoded.data.is_empty());
+    }
+
+    #[test]
+    fn test_packet_zero_port() {
+        let packet = Packet::syn(0, 1);
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.port, 0);
+        assert_eq!(decoded.stream_id, 1);
     }
 }

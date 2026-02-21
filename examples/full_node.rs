@@ -12,6 +12,9 @@ use ygg_stream::StreamManager;
 
 const YGG_NODE: &str = "tcp://192.168.44.77:7743";
 
+/// Default port for the echo service
+const ECHO_PORT: u16 = 1;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -51,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream_manager = StreamManager::new(core.packet_conn());
 
     if mode == "server" {
-        info!("Stream manager ready - waiting for incoming connections...");
+        info!("Stream manager ready - listening on port {} for incoming streams...", ECHO_PORT);
         run_server(stream_manager).await?;
     } else {
         info!("Stream manager ready - will connect to peer");
@@ -66,63 +69,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_server(mut manager: StreamManager) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(manager: StreamManager) -> Result<(), Box<dyn std::error::Error>> {
+    // Register a listener on the echo port
+    let mut listener = manager.listen(ECHO_PORT).await;
+
     loop {
-        // Accept incoming connection
-        let connection = manager.accept().await?;
-        let peer = connection.peer_addr();
-        info!("Accepted connection from peer {}", hex::encode(&peer.as_ref()[..8]));
+        // Accept incoming streams on the echo port
+        match listener.accept().await {
+            Ok(mut stream) => {
+                let peer = stream.peer_addr();
+                info!("Accepted stream {} on port {} from peer {}",
+                    stream.id(),
+                    stream.port(),
+                    hex::encode(&peer.as_ref()[..8])
+                );
 
-        // Spawn task to handle this connection
-        tokio::spawn(async move {
-            loop {
-                match connection.accept_stream().await {
-                    Ok(mut stream) => {
-                        info!("Accepted stream {} from peer {}",
-                            stream.id(),
-                            hex::encode(&peer.as_ref()[..8])
-                        );
-
-                        // Spawn task to handle this stream
-                        tokio::spawn(async move {
-                            let mut buf = vec![0u8; 1024];
-                            loop {
-                                match stream.read(&mut buf).await {
-                                    Ok(0) => {
-                                        info!("Stream {} closed by peer", stream.id());
-                                        break;
-                                    }
-                                    Ok(n) => {
-                                        info!("Stream {}: received {} bytes", stream.id(), n);
-
-                                        // Echo back
-                                        if let Err(e) = stream.write_all(&buf[..n]).await {
-                                            error!("Write error: {}", e);
-                                            break;
-                                        }
-                                        if let Err(e) = stream.flush().await {
-                                            error!("Flush error: {}", e);
-                                            break;
-                                        }
-
-                                        info!("Stream {}: echoed {} bytes", stream.id(), n);
-                                    }
-                                    Err(e) => {
-                                        error!("Read error: {}", e);
-                                        break;
-                                    }
-                                }
+                // Spawn task to handle this stream
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => {
+                                info!("Stream {} closed by peer", stream.id());
+                                break;
                             }
-                        });
+                            Ok(n) => {
+                                info!("Stream {}: received {} bytes", stream.id(), n);
+
+                                // Echo back
+                                if let Err(e) = stream.write_all(&buf[..n]).await {
+                                    error!("Write error: {}", e);
+                                    break;
+                                }
+                                if let Err(e) = stream.flush().await {
+                                    error!("Flush error: {}", e);
+                                    break;
+                                }
+
+                                info!("Stream {}: echoed {} bytes", stream.id(), n);
+                            }
+                            Err(e) => {
+                                error!("Read error: {}", e);
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        error!("Error accepting stream: {}", e);
-                        break;
-                    }
-                }
+                });
             }
-        });
+            Err(e) => {
+                error!("Error accepting stream: {}", e);
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 async fn run_client(manager: StreamManager, server_pubkey_hex: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -144,9 +145,9 @@ async fn run_client(manager: StreamManager, server_pubkey_hex: &str) -> Result<(
     let connection = manager.connect(server_addr).await?;
     info!("Connected to server!");
 
-    // Open a stream
-    let mut stream = connection.open_stream().await?;
-    info!("Opened stream {}", stream.id());
+    // Open a stream on the echo port
+    let mut stream = connection.open_stream(ECHO_PORT).await?;
+    info!("Opened stream {} on port {}", stream.id(), stream.port());
 
     // Send some messages
     for i in 1..=5 {

@@ -3,7 +3,7 @@ use crate::protocol::Packet;
 use crate::stream::{Stream, StreamState};
 use ironwood::Addr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -16,8 +16,8 @@ pub struct Connection {
     /// Remote peer address
     peer: Addr,
 
-    /// Active streams (stream_id -> Stream)
-    streams: Arc<RwLock<HashMap<u32, Arc<Stream>>>>,
+    /// Active streams ((port, stream_id) -> Stream)
+    streams: Arc<RwLock<HashMap<(u16, u16), Arc<Stream>>>>,
 
     /// Channel for incoming streams (accepted by peer)
     incoming_streams: Arc<Mutex<mpsc::Receiver<Arc<Stream>>>>,
@@ -26,7 +26,7 @@ pub struct Connection {
     incoming_tx: mpsc::Sender<Arc<Stream>>,
 
     /// Next stream ID for outgoing streams (odd for initiator, even for acceptor)
-    next_stream_id: AtomicU32,
+    next_stream_id: AtomicU16,
 
     /// Channel to send outgoing packets
     outgoing: mpsc::Sender<Packet>,
@@ -48,7 +48,7 @@ impl Connection {
             streams: Arc::new(RwLock::new(HashMap::new())),
             incoming_streams: Arc::new(Mutex::new(incoming_rx)),
             incoming_tx,
-            next_stream_id: AtomicU32::new(1), // Start with 1 (odd)
+            next_stream_id: AtomicU16::new(1), // Start with 1 (odd)
             outgoing,
             cancel: CancellationToken::new(),
             is_initiator: true,
@@ -64,7 +64,7 @@ impl Connection {
             streams: Arc::new(RwLock::new(HashMap::new())),
             incoming_streams: Arc::new(Mutex::new(incoming_rx)),
             incoming_tx,
-            next_stream_id: AtomicU32::new(2), // Start with 2 (even)
+            next_stream_id: AtomicU16::new(2), // Start with 2 (even)
             outgoing,
             cancel: CancellationToken::new(),
             is_initiator: false,
@@ -81,41 +81,42 @@ impl Connection {
         !self.cancel.is_cancelled()
     }
 
-    /// Open a new stream to the peer
+    /// Open a new stream to the peer on a given port
     ///
     /// Sends SYN packets with retransmission until SYN-ACK is received or timeout occurs.
     /// Retransmits every 500ms. Default timeout is 30 seconds.
-    pub async fn open_stream(&self) -> Result<Stream> {
-        self.open_stream_timeout(std::time::Duration::from_secs(30)).await
+    pub async fn open_stream(&self, port: u16) -> Result<Stream> {
+        self.open_stream_timeout(port, std::time::Duration::from_secs(30)).await
     }
 
-    /// Open a new stream to the peer with custom timeout
+    /// Open a new stream to the peer on a given port with custom timeout
     ///
     /// Sends SYN packets every 500ms until SYN-ACK is received or timeout occurs.
-    pub async fn open_stream_timeout(&self, timeout: std::time::Duration) -> Result<Stream> {
+    pub async fn open_stream_timeout(&self, port: u16, timeout: std::time::Duration) -> Result<Stream> {
         if self.cancel.is_cancelled() {
             return Err(Error::ConnectionClosed);
         }
 
         // Allocate stream ID (odd for initiator, even for acceptor)
         let stream_id = self.allocate_stream_id();
+        let key = (port, stream_id);
 
         // Create stream
-        let stream = Stream::new(stream_id, self.peer, self.outgoing.clone());
+        let stream = Stream::new(port, stream_id, self.peer, self.outgoing.clone());
         let stream_arc = Arc::new(stream.clone());
 
         // Register stream
         {
             let mut streams = self.streams.write().await;
-            if streams.contains_key(&stream_id) {
-                return Err(Error::StreamExists(stream_id));
+            if streams.contains_key(&key) {
+                return Err(Error::StreamExists(port, stream_id));
             }
-            streams.insert(stream_id, stream_arc);
+            streams.insert(key, stream_arc);
         }
 
         debug!(
-            "Opening stream {} to peer {:?}, timeout: {:?}",
-            stream_id,
+            "Opening stream port={} id={} to peer {:?}, timeout: {:?}",
+            port, stream_id,
             &self.peer,
             timeout
         );
@@ -125,14 +126,14 @@ impl Connection {
         loop {
             // Send SYN packet
             stream.send_syn().await?;
-            trace!("Sent SYN for stream {}", stream_id);
+            trace!("Sent SYN for port={} stream={}", port, stream_id);
 
             // Wait 500ms for SYN-ACK
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 // Cleanup: remove stream from registry
                 let mut streams = self.streams.write().await;
-                streams.remove(&stream_id);
+                streams.remove(&key);
                 return Err(Error::Timeout);
             }
 
@@ -145,7 +146,7 @@ impl Connection {
                 _ = tokio::time::sleep(wait_time) => {
                     // Check if stream is now open
                     if stream.state().await == StreamState::Open {
-                        debug!("Stream {} opened successfully", stream_id);
+                        debug!("Stream port={} id={} opened successfully", port, stream_id);
                         return Ok(stream);
                     }
                     // Loop continues to retransmit
@@ -153,7 +154,7 @@ impl Connection {
                 _ = self.cancel.cancelled() => {
                     // Cleanup
                     let mut streams = self.streams.write().await;
-                    streams.remove(&stream_id);
+                    streams.remove(&key);
                     return Err(Error::ConnectionClosed);
                 }
             }
@@ -182,7 +183,9 @@ impl Connection {
 
     /// Handle an incoming packet and route it to the appropriate stream
     pub async fn handle_packet(&self, packet: Packet) -> Result<()> {
+        let port = packet.port;
         let stream_id = packet.stream_id;
+        let key = (port, stream_id);
 
         // Check if this is a SYN packet (new stream from peer)
         if packet.is_syn() && !packet.is_ack() {
@@ -192,7 +195,7 @@ impl Connection {
         // Route to existing stream
         let stream = {
             let streams = self.streams.read().await;
-            streams.get(&stream_id).cloned()
+            streams.get(&key).cloned()
         };
 
         if let Some(stream) = stream {
@@ -201,13 +204,13 @@ impl Connection {
             // Remove stream if closed
             if stream.is_closed().await {
                 let mut streams = self.streams.write().await;
-                streams.remove(&stream_id);
-                trace!("Removed closed stream {}", stream_id);
+                streams.remove(&key);
+                trace!("Removed closed stream port={} id={}", port, stream_id);
             }
         } else {
             warn!(
-                "Received packet for unknown stream {} from peer {:?}",
-                stream_id,
+                "Received packet for unknown stream port={} id={} from peer {:?}",
+                port, stream_id,
                 &self.peer
             );
         }
@@ -217,7 +220,9 @@ impl Connection {
 
     /// Handle a new incoming stream (SYN packet)
     async fn handle_incoming_stream(&self, packet: Packet) -> Result<()> {
+        let port = packet.port;
         let stream_id = packet.stream_id;
+        let key = (port, stream_id);
 
         // Validate stream ID (should not match our allocation scheme)
         if self.is_initiator && stream_id % 2 == 1 {
@@ -236,21 +241,21 @@ impl Connection {
         // Check if stream already exists
         {
             let streams = self.streams.read().await;
-            if streams.contains_key(&stream_id) {
+            if streams.contains_key(&key) {
                 // Duplicate SYN, ignore
-                debug!("Duplicate SYN for stream {}", stream_id);
+                debug!("Duplicate SYN for port={} stream={}", port, stream_id);
                 return Ok(());
             }
         }
 
         // Create new stream and transition to Open state immediately
-        let stream = Arc::new(Stream::new(stream_id, self.peer, self.outgoing.clone()));
+        let stream = Arc::new(Stream::new(port, stream_id, self.peer, self.outgoing.clone()));
 
         // For acceptor, transition directly to Open state (we don't need to wait for SYN-ACK)
         stream.transition_to_open().await;
 
         // Send SYN-ACK to client
-        let syn_ack = Packet::syn_ack(stream_id);
+        let syn_ack = Packet::syn_ack(port, stream_id);
         self.outgoing
             .send(syn_ack)
             .await
@@ -259,7 +264,7 @@ impl Connection {
         // Register stream
         {
             let mut streams = self.streams.write().await;
-            streams.insert(stream_id, stream.clone());
+            streams.insert(key, stream.clone());
         }
 
         // Notify incoming stream channel
@@ -269,8 +274,8 @@ impl Connection {
             .map_err(|_| Error::ConnectionClosed)?;
 
         debug!(
-            "Accepted incoming stream {} from peer {:?}",
-            stream_id,
+            "Accepted incoming stream port={} id={} from peer {:?}",
+            port, stream_id,
             &self.peer
         );
 
@@ -278,7 +283,7 @@ impl Connection {
     }
 
     /// Allocate a new stream ID
-    fn allocate_stream_id(&self) -> u32 {
+    fn allocate_stream_id(&self) -> u16 {
         // Odd IDs for initiator, even for acceptor
         let increment = 2;
         self.next_stream_id.fetch_add(increment, Ordering::Relaxed)
@@ -395,11 +400,8 @@ mod tests {
 
         // Note: open_stream() now waits for SYN-ACK, so we use a short timeout
         // In a unit test without a reader task, this will timeout
-        let result1 = conn.open_stream_timeout(std::time::Duration::from_millis(100)).await;
+        let result1 = conn.open_stream_timeout(1, std::time::Duration::from_millis(100)).await;
         assert!(result1.is_err()); // Should timeout
         assert_eq!(conn.stream_count().await, 0); // Stream removed on timeout
-
-        // Test that streams ARE registered during the opening process
-        // We can't easily test successful open without a full integration test
     }
 }
