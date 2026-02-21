@@ -62,10 +62,7 @@ impl FfiNode {
 
     /// Create a node with a specific 32-byte signing key and a list of peers.
     #[uniffi::constructor]
-    pub fn new_with_key(
-        key_bytes: Vec<u8>,
-        peers: Vec<String>,
-    ) -> Result<Arc<FfiNode>, YggError> {
+    pub fn new_with_key(key_bytes: Vec<u8>, peers: Vec<String>) -> Result<Arc<FfiNode>, YggError> {
         Node::new_with_key(&key_bytes, peers)
             .map(|m| Arc::new(FfiNode(m)))
             .map_err(YggError::Generic)
@@ -128,12 +125,7 @@ impl FfiNode {
     }
 
     /// Send a connectionless datagram to a peer on the given port.
-    pub fn send_datagram(
-        &self,
-        public_key: Vec<u8>,
-        port: u16,
-        data: Vec<u8>,
-    ) -> Result<(), YggError> {
+    pub fn send_datagram(&self,public_key: Vec<u8>, port: u16, data: Vec<u8>) -> Result<(), YggError> {
         self.0
             .send_datagram(&public_key, port, &data)
             .map_err(YggError::Generic)
@@ -190,11 +182,7 @@ impl FfiConn {
     /// (UniFFI cannot express mutable byte-array arguments for in-place fills).
     ///
     /// `timeout_ms ≤ 0` means no timeout.
-    pub fn read_with_timeout(
-        &self,
-        max_bytes: u64,
-        timeout_ms: i64,
-    ) -> Result<Vec<u8>, YggError> {
+    pub fn read_with_timeout(&self,max_bytes: u64, timeout_ms: i64) -> Result<Vec<u8>, YggError> {
         let mut buf = vec![0u8; max_bytes as usize];
         let n = if timeout_ms <= 0 {
             self.0.read(&mut buf).map_err(YggError::Generic)?
@@ -210,11 +198,7 @@ impl FfiConn {
     /// Write `data` to the stream with an optional timeout.
     ///
     /// Returns the number of bytes written. `timeout_ms ≤ 0` means no timeout.
-    pub fn write_with_timeout(
-        &self,
-        data: Vec<u8>,
-        timeout_ms: i64,
-    ) -> Result<u64, YggError> {
+    pub fn write_with_timeout(&self,data: Vec<u8>, timeout_ms: i64) -> Result<u64, YggError> {
         self.0
             .write_with_timeout(&data, timeout_ms)
             .map(|n| n as u64)

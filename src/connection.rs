@@ -84,9 +84,9 @@ impl Connection {
     /// Open a new stream to the peer on a given port
     ///
     /// Sends SYN packets with retransmission until SYN-ACK is received or timeout occurs.
-    /// Retransmits every 500ms. Default timeout is 30 seconds.
+    /// Retransmits every 500ms. Default timeout is 10 seconds.
     pub async fn open_stream(&self, port: u16) -> Result<Stream> {
-        self.open_stream_timeout(port, std::time::Duration::from_secs(30)).await
+        self.open_stream_timeout(port, std::time::Duration::from_secs(10)).await
     }
 
     /// Open a new stream to the peer on a given port with custom timeout
@@ -114,12 +114,7 @@ impl Connection {
             streams.insert(key, stream_arc);
         }
 
-        debug!(
-            "Opening stream port={} id={} to peer {:?}, timeout: {:?}",
-            port, stream_id,
-            &self.peer,
-            timeout
-        );
+        debug!("Opening stream port={} id={} to peer {:?}, timeout: {:?}", port, stream_id, &self.peer, timeout);
 
         // Send SYN with retransmission until we get SYN-ACK or timeout
         let start = tokio::time::Instant::now();
@@ -208,11 +203,7 @@ impl Connection {
                 trace!("Removed closed stream port={} id={}", port, stream_id);
             }
         } else {
-            warn!(
-                "Received packet for unknown stream port={} id={} from peer {:?}",
-                port, stream_id,
-                &self.peer
-            );
+            warn!("Received packet for unknown stream port={} id={} from peer {:?}", port, stream_id, &self.peer);
         }
 
         Ok(())
@@ -226,16 +217,10 @@ impl Connection {
 
         // Validate stream ID (should not match our allocation scheme)
         if self.is_initiator && stream_id % 2 == 1 {
-            return Err(Error::Protocol(format!(
-                "Received odd stream ID {} from peer (we are initiator)",
-                stream_id
-            )));
+            return Err(Error::Protocol(format!("Received odd stream ID {} from peer (we are initiator)", stream_id)));
         }
         if !self.is_initiator && stream_id % 2 == 0 {
-            return Err(Error::Protocol(format!(
-                "Received even stream ID {} from peer (we are acceptor)",
-                stream_id
-            )));
+            return Err(Error::Protocol(format!("Received even stream ID {} from peer (we are acceptor)", stream_id)));
         }
 
         // Check if stream already exists
@@ -273,11 +258,7 @@ impl Connection {
             .await
             .map_err(|_| Error::ConnectionClosed)?;
 
-        debug!(
-            "Accepted incoming stream port={} id={} from peer {:?}",
-            port, stream_id,
-            &self.peer
-        );
+        debug!("Accepted incoming stream port={} id={} from peer {:?}", port, stream_id, &self.peer);
 
         Ok(())
     }
