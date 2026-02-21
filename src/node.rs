@@ -32,7 +32,7 @@ use tokio::sync::Mutex as TokioMutex;
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 
-use crate::manager::{ConnectHandle, Listener};
+use crate::manager::{ConnectHandle, DatagramListener, Listener};
 use crate::stream::Stream;
 use crate::StreamManager;
 
@@ -269,6 +269,41 @@ impl Node {
     /// The returned `Listener` can be used in a loop to accept many streams.
     pub fn listen(&self, port: u16) -> Listener {
         self.rt.block_on(self.handle.listen(port))
+    }
+
+    // ── datagram API ──────────────────────────────────────────────────────
+
+    /// Send a connectionless datagram to a peer on the given port.
+    ///
+    /// No handshake, no flow control, no ordering guarantees.
+    pub fn send_datagram(&self, public_key: &[u8], port: u16, data: &[u8]) -> Result<(), String> {
+        if public_key.len() != 32 {
+            return Err("public_key must be exactly 32 bytes".to_string());
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(public_key);
+        let addr = ironwood::Addr::from(key);
+        let handle = self.handle.clone();
+        let data = data.to_vec();
+        self.rt.block_on(async move {
+            handle.send_datagram(&addr, port, data).await.map_err(|e| e.to_string())
+        })
+    }
+
+    /// Register a datagram listener for the given port.
+    ///
+    /// Returns a [`DatagramListener`] for continuous receive.
+    pub fn listen_datagram(&self, port: u16) -> DatagramListener {
+        self.rt.block_on(self.handle.listen_datagram(port))
+    }
+
+    /// Register a listener and block until one datagram arrives.
+    ///
+    /// Returns `(data, sender_public_key)`.
+    pub fn recv_datagram(&self, port: u16) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let mut listener = self.rt.block_on(self.handle.listen_datagram(port));
+        let (data, addr) = self.rt.block_on(listener.recv()).map_err(|e| e.to_string())?;
+        Ok((data, addr.0.to_vec()))
     }
 
     // ── peer management ───────────────────────────────────────────────────

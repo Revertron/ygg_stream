@@ -28,6 +28,17 @@ impl From<String> for YggError {
     }
 }
 
+// ── FfiDatagram ──────────────────────────────────────────────────────────────
+
+/// A received datagram with the sender's public key.
+#[derive(uniffi::Record)]
+pub struct FfiDatagram {
+    /// Datagram payload.
+    pub data: Vec<u8>,
+    /// Sender's 32-byte ed25519 public key.
+    pub public_key: Vec<u8>,
+}
+
 // ── FfiNode ──────────────────────────────────────────────────────────────
 
 /// UniFFI-exported Yggdrasil node.
@@ -114,6 +125,29 @@ impl FfiNode {
     /// Spanning-tree entries as a JSON array.
     pub fn get_tree_json(&self) -> String {
         self.0.get_tree_json()
+    }
+
+    /// Send a connectionless datagram to a peer on the given port.
+    pub fn send_datagram(
+        &self,
+        public_key: Vec<u8>,
+        port: u16,
+        data: Vec<u8>,
+    ) -> Result<(), YggError> {
+        self.0
+            .send_datagram(&public_key, port, &data)
+            .map_err(YggError::Generic)
+    }
+
+    /// Block until a datagram arrives on the given port.
+    ///
+    /// Registers a listener, receives one datagram, and returns it.
+    pub fn recv_datagram(&self, port: u16) -> Result<FfiDatagram, YggError> {
+        let (data, public_key) = self
+            .0
+            .recv_datagram(port)
+            .map_err(YggError::Generic)?;
+        Ok(FfiDatagram { data, public_key })
     }
 
 }

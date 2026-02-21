@@ -11,6 +11,7 @@ A lightweight stream multiplexing library built on top of ironwood's encrypted P
 - **Simple custom protocol** - optimized for PacketConn semantics (7-byte header overhead)
 - **Flow control** - window-based flow control (256 KB default) prevents buffer overflow
 - **Graceful shutdown** - proper FIN handshake for clean stream closure
+- **Connectionless datagrams** - fire-and-forget messages (UDP-like) with port-based routing, no handshake or flow control
 
 ## Architecture
 
@@ -34,6 +35,7 @@ ironwood (encrypted PacketConn)
 - `ACK (0x02)`: Acknowledge
 - `FIN (0x04)`: Close gracefully
 - `RST (0x08)`: Reset stream (immediate close)
+- `DGRAM (0x10)`: Connectionless datagram (no stream_id, no handshake)
 
 **Stream Lifecycle**:
 1. **SYN**: Initiator opens stream on a port
@@ -46,6 +48,12 @@ ironwood (encrypted PacketConn)
 - Each node registers listeners on specific ports via `listen(port)`
 - Incoming SYN packets for ports without a listener receive an RST
 - Different services bind different ports, each with their own accept channel
+
+**Datagrams**:
+- Fire-and-forget messages routed by port only (`stream_id = 0`)
+- No handshake, no flow control, no ordering — like UDP
+- Register with `listen_datagram(port)`, send with `send_datagram(peer, port, data)`
+- Dropped silently if no listener or channel is full
 
 **Stream ID Allocation**:
 - Initiator uses **odd IDs** (1, 3, 5, ...)
@@ -222,6 +230,23 @@ tokio::spawn(async move {
 });
 ```
 
+### Connectionless Datagrams
+
+```rust
+let manager = StreamManager::new(conn);
+
+// Receive side: listen for datagrams on a port
+let mut dg_listener = manager.listen_datagram(42).await;
+tokio::spawn(async move {
+    while let Ok((data, sender)) = dg_listener.recv().await {
+        println!("Got {} bytes from {:?}", data.len(), sender);
+    }
+});
+
+// Send side: fire-and-forget, no connection needed
+manager.send_datagram(&peer_addr, 42, b"ping".to_vec()).await?;
+```
+
 ## Running Examples
 
 ### Full Yggdrasil Node with Stream Multiplexing
@@ -267,18 +292,23 @@ cargo run -p ygg_stream --example client <peer_public_key_hex>
    - Per-port accept channel returned by `listen(port)`
    - `accept()` yields incoming streams on that port
 
-3. **Connection** (`connection.rs`)
+3. **DatagramListener** (`manager.rs`)
+   - Per-port datagram channel returned by `listen_datagram(port)`
+   - `recv()` yields `(data, sender_addr)` pairs
+   - Bounded channel — datagrams dropped silently when full
+
+4. **Connection** (`connection.rs`)
    - Represents multiplexed connection to single peer
    - Manages multiple streams keyed by (port, stream_id)
    - Stream ID allocation (odd/even separation)
 
-4. **Stream** (`stream.rs`)
+5. **Stream** (`stream.rs`)
    - Individual bidirectional stream with port and stream_id
    - Implements `AsyncRead` + `AsyncWrite`
    - Flow control with send/receive windows
    - State machine: Opening → Open → Closing → Closed
 
-5. **Protocol** (`protocol.rs`)
+6. **Protocol** (`protocol.rs`)
    - Packet encoding/decoding
    - Port + stream_id packed into a single u32 on the wire
    - Protocol constants and flags
@@ -313,6 +343,7 @@ Integration tests demonstrate:
 - Port-based stream routing
 - Stream ID allocation
 - Connection lifecycle
+- Connectionless datagram send/receive
 
 ## Advantages Over QUIC
 

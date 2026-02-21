@@ -1,6 +1,6 @@
 use crate::connection::Connection;
 use crate::error::{Error, Result};
-use crate::protocol::Packet;
+use crate::protocol::{Packet, MAX_DATA_SIZE};
 use crate::stream::Stream;
 use ironwood::{Addr, EncryptedPacketConn, PacketConn};
 use std::collections::HashMap;
@@ -34,6 +34,32 @@ impl Listener {
     }
 }
 
+/// A per-port datagram receiver.
+///
+/// Created by [`StreamManager::listen_datagram`] or [`ConnectHandle::listen_datagram`].
+/// Call [`DatagramListener::recv`] to receive incoming datagrams on this port.
+pub struct DatagramListener {
+    port: u16,
+    rx: mpsc::Receiver<(Vec<u8>, Addr)>,
+}
+
+impl DatagramListener {
+    /// The port this datagram listener is bound to.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Receive the next datagram on this port.
+    ///
+    /// Returns `(data, sender_addr)`.
+    pub async fn recv(&mut self) -> Result<(Vec<u8>, Addr)> {
+        self.rx
+            .recv()
+            .await
+            .ok_or(Error::ConnectionClosed)
+    }
+}
+
 /// StreamManager manages connections and stream multiplexing
 ///
 /// Wraps an EncryptedPacketConn and provides stream-oriented API.
@@ -47,6 +73,9 @@ pub struct StreamManager {
     /// Per-port listener senders
     listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>>,
 
+    /// Per-port datagram listener senders
+    datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>>,
+
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
 }
@@ -56,11 +85,14 @@ impl StreamManager {
     pub fn new(conn: Arc<EncryptedPacketConn>) -> Self {
         let listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let manager = Self {
             conn: conn.clone(),
             connections: Arc::new(RwLock::new(HashMap::new())),
             listeners: listeners.clone(),
+            datagram_listeners: datagram_listeners.clone(),
             cancel: CancellationToken::new(),
         };
 
@@ -68,7 +100,7 @@ impl StreamManager {
         let connections = manager.connections.clone();
         let cancel = manager.cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) = reader_task(conn, connections, listeners, cancel).await {
+            if let Err(e) = reader_task(conn, connections, listeners, datagram_listeners, cancel).await {
                 error!("Reader task error: {}", e);
             }
         });
@@ -84,6 +116,30 @@ impl StreamManager {
         let (tx, rx) = mpsc::channel(16);
         self.listeners.write().await.insert(port, tx);
         Listener { port, rx }
+    }
+
+    /// Register a datagram listener for the given port.
+    ///
+    /// Returns a [`DatagramListener`] whose `recv()` yields incoming datagrams.
+    /// Datagrams arriving on ports with no listener are silently dropped.
+    pub async fn listen_datagram(&self, port: u16) -> DatagramListener {
+        let (tx, rx) = mpsc::channel(64);
+        self.datagram_listeners.write().await.insert(port, tx);
+        DatagramListener { port, rx }
+    }
+
+    /// Send a connectionless datagram to a peer on the given port.
+    ///
+    /// Bypasses the Connection/Stream machinery entirely — no handshake,
+    /// no flow control, no ordering guarantees.
+    pub async fn send_datagram(&self, peer: &Addr, port: u16, data: Vec<u8>) -> Result<()> {
+        if data.len() > MAX_DATA_SIZE {
+            return Err(Error::PacketTooLarge(data.len(), MAX_DATA_SIZE));
+        }
+        let pkt = Packet::datagram(port, data);
+        let encoded = pkt.encode()?;
+        self.conn.write_to(&encoded, peer).await?;
+        Ok(())
     }
 
     /// Connect to a peer (or reuse existing connection)
@@ -164,6 +220,7 @@ impl StreamManager {
             conn: self.conn.clone(),
             connections: self.connections.clone(),
             listeners: self.listeners.clone(),
+            datagram_listeners: self.datagram_listeners.clone(),
             cancel: self.cancel.clone(),
         };
 
@@ -185,6 +242,7 @@ pub struct ConnectHandle {
     conn: Arc<EncryptedPacketConn>,
     connections: Arc<RwLock<HashMap<Addr, Arc<Connection>>>>,
     listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>>,
+    datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>>,
     cancel: CancellationToken,
 }
 
@@ -232,6 +290,24 @@ impl ConnectHandle {
         Listener { port, rx }
     }
 
+    /// Register a datagram listener for the given port.
+    pub async fn listen_datagram(&self, port: u16) -> DatagramListener {
+        let (tx, rx) = mpsc::channel(64);
+        self.datagram_listeners.write().await.insert(port, tx);
+        DatagramListener { port, rx }
+    }
+
+    /// Send a connectionless datagram to a peer on the given port.
+    pub async fn send_datagram(&self, peer: &Addr, port: u16, data: Vec<u8>) -> Result<()> {
+        if data.len() > MAX_DATA_SIZE {
+            return Err(Error::PacketTooLarge(data.len(), MAX_DATA_SIZE));
+        }
+        let pkt = Packet::datagram(port, data);
+        let encoded = pkt.encode()?;
+        self.conn.write_to(&encoded, peer).await?;
+        Ok(())
+    }
+
     /// Get the local node address.
     pub fn local_addr(&self) -> Addr {
         self.conn.local_addr()
@@ -258,6 +334,7 @@ async fn reader_task(
     conn: Arc<EncryptedPacketConn>,
     connections: Arc<RwLock<HashMap<Addr, Arc<Connection>>>>,
     listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>>,
+    datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
@@ -276,6 +353,17 @@ async fn reader_task(
                         continue;
                     }
                 };
+
+                // Handle datagrams — bypass all stream/connection routing
+                if packet.is_dgram() {
+                    let dg_listeners = datagram_listeners.read().await;
+                    if let Some(tx) = dg_listeners.get(&packet.port) {
+                        let _ = tx.try_send((packet.data, peer));
+                    } else {
+                        trace!("No datagram listener for port {}, dropping", packet.port);
+                    }
+                    continue;
+                }
 
                 let port = packet.port;
 
@@ -460,5 +548,18 @@ mod tests {
 
         // Verify the listener is registered
         assert!(manager.listeners.read().await.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn test_manager_listen_datagram() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+
+        let dg_listener = manager.listen_datagram(99).await;
+        assert_eq!(dg_listener.port(), 99);
+
+        // Verify the datagram listener is registered
+        assert!(manager.datagram_listeners.read().await.contains_key(&99));
     }
 }

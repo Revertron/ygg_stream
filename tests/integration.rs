@@ -160,6 +160,56 @@ async fn test_tcp_multiple_streams() {
     manager2.close().await;
 }
 
+/// Verify connectionless datagram send/receive works.
+#[tokio::test]
+async fn test_tcp_datagram_send_recv() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("info,ygg_stream=debug")
+        .try_init();
+
+    let port1 = 19004;
+
+    let core1 = create_node_with_listener(port1).await;
+    let addr1 = core1.packet_conn().local_addr();
+
+    let peer_uri = format!("tcp://127.0.0.1:{}", port1);
+    let core2 = create_node_with_peer(&peer_uri).await;
+    let addr2 = core2.packet_conn().local_addr();
+
+    // Wait 2 seconds before the nodes establish routing
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let manager1 = StreamManager::new(core1.packet_conn());
+    let manager2 = StreamManager::new(core2.packet_conn());
+
+    // Node 1 listens for datagrams on TEST_PORT
+    let mut dg_listener1 = manager1.listen_datagram(TEST_PORT).await;
+
+    // Send several datagrams so ironwood has a chance to establish the route
+    let msg = b"hello datagram!";
+    for _ in 0..10 {
+        let _ = manager2.send_datagram(&addr1, TEST_PORT, msg.to_vec()).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    // Receive at least one datagram on node 1
+    let (data, sender) = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        dg_listener1.recv(),
+    )
+    .await
+    .expect("Timeout receiving datagram on node 1")
+    .unwrap();
+
+    assert_eq!(data, msg);
+    assert_eq!(sender, addr2);
+
+    // Clean shutdown
+    manager1.close().await;
+    manager2.close().await;
+}
+
 /// Verify streams can be opened and data exchanged in both directions concurrently.
 #[tokio::test]
 async fn test_tcp_bidirectional_multiple_streams() {

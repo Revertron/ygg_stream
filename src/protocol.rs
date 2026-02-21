@@ -6,6 +6,7 @@ pub const FLAG_SYN: u8 = 0x01; // Open stream
 pub const FLAG_ACK: u8 = 0x02; // Acknowledge
 pub const FLAG_FIN: u8 = 0x04; // Close stream gracefully
 pub const FLAG_RST: u8 = 0x08; // Reset stream (abort)
+pub const FLAG_DGRAM: u8 = 0x10; // Connectionless datagram
 
 /// Default flow control window size (256 KB)
 pub const DEFAULT_WINDOW_SIZE: usize = 256 * 1024;
@@ -94,6 +95,11 @@ impl Packet {
         Self::new(port, stream_id, FLAG_RST, Vec::new())
     }
 
+    /// Create a datagram packet (connectionless, no stream_id)
+    pub fn datagram(port: u16, data: Vec<u8>) -> Self {
+        Self::new(port, 0, FLAG_DGRAM, data)
+    }
+
     /// Create an ACK packet with window update
     pub fn ack(port: u16, stream_id: u16, window: usize) -> Self {
         Self {
@@ -123,6 +129,11 @@ impl Packet {
     /// Check if packet has RST flag
     pub fn is_rst(&self) -> bool {
         self.flags & FLAG_RST != 0
+    }
+
+    /// Check if packet is a datagram
+    pub fn is_dgram(&self) -> bool {
+        self.flags & FLAG_DGRAM != 0
     }
 
     /// Encode packet to bytes
@@ -342,6 +353,31 @@ mod tests {
         assert_eq!(decoded.stream_id, 1);
         assert!(decoded.is_ack());
         assert!(decoded.data.is_empty());
+    }
+
+    #[test]
+    fn test_packet_datagram() {
+        let packet = Packet::datagram(100, b"dgram payload".to_vec());
+        assert_eq!(packet.port, 100);
+        assert_eq!(packet.stream_id, 0);
+        assert!(packet.is_dgram());
+        assert!(!packet.is_syn());
+        assert!(!packet.is_ack());
+        assert!(!packet.is_fin());
+        assert!(!packet.is_rst());
+        assert_eq!(packet.data, b"dgram payload");
+    }
+
+    #[test]
+    fn test_packet_datagram_encode_decode() {
+        let packet = Packet::datagram(42, b"hello datagram".to_vec());
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.port, 42);
+        assert_eq!(decoded.stream_id, 0);
+        assert!(decoded.is_dgram());
+        assert_eq!(decoded.data, b"hello datagram");
     }
 
     #[test]
