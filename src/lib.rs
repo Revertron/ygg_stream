@@ -52,6 +52,7 @@
 // UniFFI scaffolding — must be in the crate root.
 uniffi::setup_scaffolding!("ygg_stream");
 
+pub mod async_node;
 pub mod connection;
 pub mod error;
 pub mod ffi;
@@ -61,6 +62,7 @@ pub mod protocol;
 pub mod stream;
 
 // Re-export main types
+pub use async_node::{AsyncConn, AsyncNode};
 pub use connection::Connection;
 pub use error::{Error, Result};
 pub use manager::{ConnectHandle, DatagramListener, Listener, StreamManager};

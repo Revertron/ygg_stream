@@ -109,6 +109,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## High-Level API: AsyncNode / Node
+
+For applications that just want to connect and exchange data without manually wiring up `Core` + `StreamManager`, the library provides two convenience wrappers:
+
+| Type | Environment | I/O style |
+|------|-------------|-----------|
+| `AsyncNode` / `AsyncConn` | Inside a tokio runtime | `async fn` |
+| `Node` / `Conn` | Blocking / FFI (Android) | Blocking (`block_on`) |
+
+Both expose the same operations: `connect`, `accept`, `listen`, `send_datagram`, `recv_datagram`, peer management, and network introspection.
+
+### AsyncNode (async)
+
+Use `AsyncNode` when your application already runs inside a tokio runtime. No internal runtime is created — all methods are `async fn`.
+
+```rust
+use ygg_stream::AsyncNode;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    // Start a node and connect to a peer
+    let node = AsyncNode::new("tcp://1.2.3.4:1234").await?;
+    println!("My key: {}", hex::encode(node.public_key()));
+
+    // Client: connect and open a stream on port 80
+    let conn = node.connect(&peer_key, 80).await?;
+    conn.write(b"hello").await?;
+    let mut buf = vec![0u8; 1024];
+    let n = conn.read(&mut buf).await?;
+    conn.close().await;
+
+    // Server: accept streams on port 80
+    let mut listener = node.listen(80).await;
+    loop {
+        let stream = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            // handle stream...
+        });
+    }
+}
+```
+
+### Node (blocking / FFI)
+
+Use `Node` when calling from a synchronous context (e.g., Java/Kotlin via UniFFI). It owns a tokio `Runtime` internally and calls `block_on()` for every operation.
+
+```rust
+use ygg_stream::Node;
+
+fn main() -> Result<(), String> {
+    let node = Node::new("tcp://1.2.3.4:1234")?;
+
+    // Client
+    let conn = node.connect(&peer_key, 80)?;
+    conn.write(b"hello")?;
+    let mut buf = vec![0u8; 1024];
+    let n = conn.read(&mut buf)?;
+    conn.close();
+
+    // Server
+    let conn = node.accept(80)?;
+    // ...
+
+    node.close();
+    Ok(())
+}
+```
+
+> **Note**: Do not use `Node`/`Conn` from inside a tokio runtime — calling `block_on()` within an async context will panic. Use `AsyncNode`/`AsyncConn` instead.
+
+## Low-Level API: StreamManager
+
+For full control over the Yggdrasil core and stream multiplexing, use `StreamManager` and `ConnectHandle` directly.
+
 ## Usage Examples
 
 ### Echo Server
