@@ -998,7 +998,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "ironwood"
 version = "0.1.1"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=7905b4f2#7905b4f227151e5bac7b9443fec73a5584907f01"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=36811dd#36811dd40210d9b3fefe09d89c0bb02b2039d7a1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3007,7 +3007,7 @@ dependencies = [
 [[package]]
 name = "yggdrasil"
 version = "0.1.1"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=7905b4f2#7905b4f227151e5bac7b9443fec73a5584907f01"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=36811dd#36811dd40210d9b3fefe09d89c0bb02b2039d7a1"
 dependencies = [
  "blake2",
  "comfy-table",

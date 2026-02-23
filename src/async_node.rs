@@ -34,7 +34,6 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex as TokioMutex;
 
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
@@ -50,7 +49,11 @@ use crate::StreamManager;
 /// All I/O methods are **async** — suitable for use inside a tokio runtime.
 /// This is the async counterpart of [`Conn`](crate::Conn).
 pub struct AsyncConn {
-    stream: Arc<TokioMutex<Stream>>,
+    /// The underlying stream. All fields inside are `Arc`-wrapped, so
+    /// `Stream::clone()` is cheap and the clones share state.  We clone
+    /// into a local `&mut Stream` for each I/O call so that read and write
+    /// can proceed concurrently without an outer mutex.
+    stream: Stream,
     /// Remote peer's 32-byte ed25519 public key.
     public_key: Vec<u8>,
     /// The port this stream is on.
@@ -60,7 +63,7 @@ pub struct AsyncConn {
 impl AsyncConn {
     pub(crate) fn new(stream: Stream, public_key: Vec<u8>, port: u16) -> Self {
         Self {
-            stream: Arc::new(TokioMutex::new(stream)),
+            stream,
             public_key,
             port,
         }
@@ -78,17 +81,16 @@ impl AsyncConn {
 
     /// Returns `true` while the stream is open.
     pub async fn is_alive(&self) -> bool {
-        let s = self.stream.lock().await;
         matches!(
-            s.state().await,
+            self.stream.state().await,
             crate::StreamState::Open | crate::StreamState::Opening
         )
     }
 
     /// Read data into `buf`. Returns the number of bytes read.
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
-        let mut s = self.stream.lock().await;
-        AsyncReadExt::read(&mut *s, buf)
+        let mut s = self.stream.clone();
+        AsyncReadExt::read(&mut s, buf)
             .await
             .map_err(|e| e.to_string())
     }
@@ -104,8 +106,8 @@ impl AsyncConn {
             return self.read(buf).await;
         }
         let dur = Duration::from_millis(timeout_ms as u64);
-        let mut s = self.stream.lock().await;
-        tokio::time::timeout(dur, AsyncReadExt::read(&mut *s, buf))
+        let mut s = self.stream.clone();
+        tokio::time::timeout(dur, AsyncReadExt::read(&mut s, buf))
             .await
             .map_err(|_| "timeout".to_string())?
             .map_err(|e| e.to_string())
@@ -113,8 +115,8 @@ impl AsyncConn {
 
     /// Write `buf` to the stream. Returns the number of bytes written.
     pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
-        let mut s = self.stream.lock().await;
-        AsyncWriteExt::write(&mut *s, buf)
+        let mut s = self.stream.clone();
+        AsyncWriteExt::write(&mut s, buf)
             .await
             .map_err(|e| e.to_string())
     }
@@ -130,8 +132,8 @@ impl AsyncConn {
             return self.write(buf).await;
         }
         let dur = Duration::from_millis(timeout_ms as u64);
-        let mut s = self.stream.lock().await;
-        tokio::time::timeout(dur, AsyncWriteExt::write(&mut *s, buf))
+        let mut s = self.stream.clone();
+        tokio::time::timeout(dur, AsyncWriteExt::write(&mut s, buf))
             .await
             .map_err(|_| "timeout".to_string())?
             .map_err(|e| e.to_string())
@@ -139,7 +141,7 @@ impl AsyncConn {
 
     /// Close the stream gracefully.
     pub async fn close(&self) {
-        let mut s = self.stream.lock().await;
+        let mut s = self.stream.clone();
         let _ = s.shutdown().await;
     }
 }

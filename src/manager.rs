@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// A per-port accept channel.
 ///
@@ -343,13 +343,13 @@ async fn reader_task(
         tokio::select! {
             result = conn.read_from(&mut buf) => {
                 let (n, peer) = result?;
-                trace!("Received {} bytes from peer {:?}", n, &peer.as_ref()[..8]);
+                trace!("Received {} bytes from peer {:?}", n, hex::encode(&peer.as_ref()[..8]));
 
                 // Decode packet
                 let packet = match Packet::decode(&buf[..n]) {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!("Failed to decode packet from peer {:?}: {}", &peer.as_ref()[..8], e);
+                        warn!("Failed to decode packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
                         continue;
                     }
                 };
@@ -381,7 +381,7 @@ async fn reader_task(
                         let has_listener = listeners.read().await.contains_key(&port);
                         if !has_listener {
                             // No listener for this port — send RST
-                            warn!("No listener for port {} from peer {:?}, sending RST", port, &peer.as_ref()[..8]);
+                            warn!("No listener for port {} from peer {:?}, sending RST", port, hex::encode(&peer.as_ref()[..8]));
                             let rst = Packet::rst(port, packet.stream_id);
                             let rst_data = match rst.encode() {
                                 Ok(d) => d,
@@ -393,7 +393,7 @@ async fn reader_task(
                     }
 
                     if let Err(e) = conn_arc.handle_packet(packet).await {
-                        warn!("Error handling packet from peer {:?}: {}", &peer.as_ref()[..8], e);
+                        warn!("Error handling packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
                     } else if is_new_syn {
                         // Stream was just created — pull it from the connection's
                         // internal channel and forward to the port listener.
@@ -413,7 +413,7 @@ async fn reader_task(
                         // Check if there's a listener for this port
                         let has_listener = listeners.read().await.contains_key(&port);
                         if !has_listener {
-                            warn!("No listener for port {} from new peer {:?}, sending RST", port, &peer.as_ref()[..8]);
+                            warn!("No listener for port {} from new peer {:?}, sending RST", port, hex::encode(&peer.as_ref()[..8]));
                             let rst = Packet::rst(port, packet.stream_id);
                             let rst_data = match rst.encode() {
                                 Ok(d) => d,
@@ -423,7 +423,7 @@ async fn reader_task(
                             continue;
                         }
 
-                        debug!("New incoming connection from peer {:?}", &peer.as_ref()[..8]);
+                        info!("New incoming connection from peer {:?}", hex::encode(&peer.as_ref()[..8]));
 
                         // Create connection as acceptor
                         let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
@@ -440,13 +440,13 @@ async fn reader_task(
                         let cancel_clone = cancel.clone();
                         tokio::spawn(async move {
                             if let Err(e) = writer_task(conn_clone, peer, outgoing_rx, cancel_clone).await {
-                                error!("Writer task error for peer {:?}: {}", &peer.as_ref()[..8], e);
+                                error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
                             }
                         });
 
                         // Handle the SYN packet (creates stream, sends SYN-ACK)
                         if let Err(e) = connection.handle_packet(packet).await {
-                            warn!("Error handling SYN packet from peer {:?}: {}", &peer.as_ref()[..8], e);
+                            warn!("Error handling SYN packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
                             continue;
                         }
 
@@ -462,7 +462,7 @@ async fn reader_task(
                             }
                         }
                     } else {
-                        trace!("Received packet from unknown peer {:?}, ignoring", &peer.as_ref()[..8]);
+                        trace!("Received packet from unknown peer {:?}, ignoring", hex::encode(&peer.as_ref()[..8]));
                     }
                 }
             }
