@@ -22,6 +22,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "android_log-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85965b6739a430150bdd138e2374a98af0c3ee0d030b3bb7fc3bddff58d0102e"
+
+[[package]]
 name = "anstyle"
 version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -998,7 +1004,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "ironwood"
 version = "0.1.1"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=36811dd#36811dd40210d9b3fefe09d89c0bb02b2039d7a1"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=7d46bb04#7d46bb04aa54b78cee5e43594ee685d3c750e777"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2138,6 +2144,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-android"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12612be8f868a09c0ceae7113ff26afe79d81a24473a393cb9120ece162e86c0"
+dependencies = [
+ "android_log-sys",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-attributes"
 version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2999,6 +3016,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-android",
  "tracing-subscriber",
  "uniffi",
  "yggdrasil",
@@ -3007,7 +3025,7 @@ dependencies = [
 [[package]]
 name = "yggdrasil"
 version = "0.1.1"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=36811dd#36811dd40210d9b3fefe09d89c0bb02b2039d7a1"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=7d46bb04#7d46bb04aa54b78cee5e43594ee685d3c750e777"
 dependencies = [
  "blake2",
  "comfy-table",

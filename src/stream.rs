@@ -267,10 +267,7 @@ impl Stream {
 
 impl AsyncRead for Stream {
     fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+        self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         // Try to lock recv_buf
@@ -327,10 +324,7 @@ impl AsyncRead for Stream {
 
 impl AsyncWrite for Stream {
     fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+        self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
         // Check stream state

@@ -167,9 +167,10 @@ impl Packet {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < HEADER_SIZE {
             return Err(Error::Protocol(format!(
-                "Packet too short: {} bytes (expected at least {})",
+                "Packet too short: {} bytes (expected at least {}) [{}]",
                 buf.len(),
-                HEADER_SIZE
+                HEADER_SIZE,
+                hex::encode(&buf[..buf.len()])
             )));
         }
 

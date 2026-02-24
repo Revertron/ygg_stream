@@ -183,6 +183,19 @@ impl Node {
         self.rt.block_on(self.inner.recv_datagram(port))
     }
 
+    /// Block until a datagram arrives or the timeout expires.
+    ///
+    /// `timeout_ms ≤ 0` means no timeout.
+    /// Returns `(data, sender_public_key)`.
+    pub fn recv_datagram_with_timeout(
+        &self,
+        port: u16,
+        timeout_ms: i64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.rt
+            .block_on(self.inner.recv_datagram_with_timeout(port, timeout_ms))
+    }
+
     // ── peer management ───────────────────────────────────────────────────
 
     /// Add a peer by URI (e.g. `"tcp://1.2.3.4:1234"` or `"tls://…"`).

@@ -9,9 +9,31 @@
 //!   (UniFFI cannot express in-place mutation of a byte array).
 //!   The Kotlin wrapper copies the returned bytes into the caller's buffer.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use crate::node::{Conn, Node};
+
+/// Initialize tracing (Android → logcat, other platforms → stderr).
+fn init_tracing() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        #[cfg(target_os = "android")]
+        {
+            tracing_subscriber::registry()
+                .with(tracing_android::layer("ygg_stream").unwrap())
+                .init();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+        }
+    });
+}
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -55,6 +77,7 @@ impl FfiNode {
     /// Pass an empty string to start without any initial peers.
     #[uniffi::constructor]
     pub fn new_(peer_addr: String) -> Result<Arc<FfiNode>, YggError> {
+        //init_tracing();
         Node::new(&peer_addr)
             .map(|m| Arc::new(FfiNode(m)))
             .map_err(YggError::Generic)
@@ -63,6 +86,7 @@ impl FfiNode {
     /// Create a node with a specific 32-byte signing key and a list of peers.
     #[uniffi::constructor]
     pub fn new_with_key(key_bytes: Vec<u8>, peers: Vec<String>) -> Result<Arc<FfiNode>, YggError> {
+        //init_tracing();
         Node::new_with_key(&key_bytes, peers)
             .map(|m| Arc::new(FfiNode(m)))
             .map_err(YggError::Generic)
@@ -133,11 +157,23 @@ impl FfiNode {
 
     /// Block until a datagram arrives on the given port.
     ///
-    /// Registers a listener, receives one datagram, and returns it.
+    /// Creates a listener on first call and reuses it for subsequent calls.
     pub fn recv_datagram(&self, port: u16) -> Result<FfiDatagram, YggError> {
         let (data, public_key) = self
             .0
             .recv_datagram(port)
+            .map_err(YggError::Generic)?;
+        Ok(FfiDatagram { data, public_key })
+    }
+
+    /// Block until a datagram arrives or the timeout expires.
+    ///
+    /// `timeout_ms ≤ 0` means no timeout.
+    /// Creates a listener on first call and reuses it for subsequent calls.
+    pub fn recv_datagram_with_timeout(&self, port: u16, timeout_ms: i64) -> Result<FfiDatagram, YggError> {
+        let (data, public_key) = self
+            .0
+            .recv_datagram_with_timeout(port, timeout_ms)
             .map_err(YggError::Generic)?;
         Ok(FfiDatagram { data, public_key })
     }

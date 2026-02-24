@@ -144,14 +144,23 @@ impl StreamManager {
 
     /// Connect to a peer (or reuse existing connection)
     pub async fn connect(&self, peer: Addr) -> Result<Arc<Connection>> {
-        // Check if connection already exists
+        // Check if connection already exists and is alive
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&peer) {
                 if conn.is_alive() {
-                    debug!("Reusing existing connection to peer {:?}", &peer.as_ref()[..8]);
+                    debug!("Reusing existing connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
                     return Ok(conn.clone());
                 }
+            }
+        }
+
+        // Remove stale connection if present
+        {
+            let mut connections = self.connections.write().await;
+            if let Some(old) = connections.remove(&peer) {
+                debug!("Removing stale connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
+                old.close().await;
             }
         }
 
@@ -165,16 +174,19 @@ impl StreamManager {
             connections.insert(peer, connection.clone());
         }
 
-        // Spawn writer task for this connection
+        // Spawn writer task for this connection.
+        // When the writer task exits, mark the connection dead.
         let conn = self.conn.clone();
         let cancel = self.cancel.clone();
+        let conn_ref = connection.clone();
         tokio::spawn(async move {
             if let Err(e) = writer_task(conn, peer, outgoing_rx, cancel).await {
-                error!("Writer task error for peer {:?}: {}", &peer.as_ref()[..8], e);
+                error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
             }
+            conn_ref.mark_dead().await;
         });
 
-        debug!("Created new connection to peer {:?}", &peer.as_ref()[..8]);
+        debug!("Created new connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
 
         Ok(connection)
     }
@@ -249,14 +261,23 @@ pub struct ConnectHandle {
 impl ConnectHandle {
     /// Connect to a peer (or reuse existing connection).
     pub async fn connect(&self, peer: Addr) -> Result<Arc<Connection>> {
-        // Check if connection already exists
+        // Check if connection already exists and is alive
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&peer) {
                 if conn.is_alive() {
-                    debug!("Reusing existing connection to peer {:?}", &peer.as_ref()[..8]);
+                    debug!("Reusing existing connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
                     return Ok(conn.clone());
                 }
+            }
+        }
+
+        // Remove stale connection if present
+        {
+            let mut connections = self.connections.write().await;
+            if let Some(old) = connections.remove(&peer) {
+                debug!("Removing stale connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
+                old.close().await;
             }
         }
 
@@ -270,16 +291,21 @@ impl ConnectHandle {
             connections.insert(peer, connection.clone());
         }
 
-        // Spawn writer task for this connection
+        // Spawn writer task for this connection.
+        // When the writer task exits (error or channel close), cancel the
+        // connection so that `is_alive()` returns false and future connect
+        // calls create a fresh connection instead of reusing a dead one.
         let conn = self.conn.clone();
         let cancel = self.cancel.clone();
+        let conn_ref = connection.clone();
         tokio::spawn(async move {
             if let Err(e) = writer_task(conn, peer, outgoing_rx, cancel).await {
-                error!("Writer task error for peer {:?}: {}", &peer.as_ref()[..8], e);
+                error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
             }
+            conn_ref.mark_dead().await;
         });
 
-        debug!("Created new connection to peer {:?}", &peer.as_ref()[..8]);
+        debug!("Created new connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
         Ok(connection)
     }
 
@@ -343,7 +369,7 @@ async fn reader_task(
         tokio::select! {
             result = conn.read_from(&mut buf) => {
                 let (n, peer) = result?;
-                trace!("Received {} bytes from peer {:?}", n, hex::encode(&peer.as_ref()[..8]));
+                debug!("Received {} bytes from peer {}", n, hex::encode(&peer.as_ref()[..8]));
 
                 // Decode packet
                 let packet = match Packet::decode(&buf[..n]) {
@@ -392,20 +418,29 @@ async fn reader_task(
                         }
                     }
 
-                    if let Err(e) = conn_arc.handle_packet(packet).await {
-                        warn!("Error handling packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-                    } else if is_new_syn {
-                        // Stream was just created — pull it from the connection's
-                        // internal channel and forward to the port listener.
-                        if let Ok(stream) = conn_arc.accept_stream().await {
-                            let listeners_guard = listeners.read().await;
-                            if let Some(tx) = listeners_guard.get(&port) {
-                                let stream_arc = Arc::new(stream);
-                                if tx.send(stream_arc).await.is_err() {
-                                    warn!("Listener channel closed for port {}", port);
+                    match conn_arc.handle_packet(packet).await {
+                        Err(e) => {
+                            warn!("Error handling packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
+                        }
+                        Ok(true) if is_new_syn => {
+                            // New stream was created — pull it from the connection's
+                            // internal channel and forward to the port listener.
+                            if let Ok(stream) = conn_arc.accept_stream().await {
+                                let listeners_guard = listeners.read().await;
+                                if let Some(tx) = listeners_guard.get(&port) {
+                                    let stream_arc = Arc::new(stream);
+                                    if tx.send(stream_arc).await.is_err() {
+                                        warn!("Listener channel closed for port {}", port);
+                                    }
                                 }
                             }
                         }
+                        Ok(false) if is_new_syn => {
+                            // Duplicate SYN retransmission — SYN-ACK was resent
+                            // by handle_packet, no new stream to accept.
+                            debug!("Duplicate SYN from peer {:?} port={}, SYN-ACK resent", hex::encode(&peer.as_ref()[..8]), port);
+                        }
+                        _ => {}
                     }
                 } else {
                     // New incoming connection
@@ -435,19 +470,30 @@ async fn reader_task(
                             conns.insert(peer, connection.clone());
                         }
 
-                        // Spawn writer task
+                        // Spawn writer task — mark connection dead on exit
                         let conn_clone = conn.clone();
                         let cancel_clone = cancel.clone();
+                        let conn_ref = connection.clone();
                         tokio::spawn(async move {
                             if let Err(e) = writer_task(conn_clone, peer, outgoing_rx, cancel_clone).await {
                                 error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
                             }
+                            conn_ref.mark_dead().await;
                         });
 
                         // Handle the SYN packet (creates stream, sends SYN-ACK)
-                        if let Err(e) = connection.handle_packet(packet).await {
-                            warn!("Error handling SYN packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-                            continue;
+                        match connection.handle_packet(packet).await {
+                            Err(e) => {
+                                warn!("Error handling SYN packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
+                                continue;
+                            }
+                            Ok(false) => {
+                                // Duplicate SYN on a brand-new connection — shouldn't
+                                // happen, but handle gracefully.
+                                debug!("Duplicate SYN on new connection from {:?}", hex::encode(&peer.as_ref()[..8]));
+                                continue;
+                            }
+                            Ok(true) => {}
                         }
 
                         // Route the accepted stream to the port listener
@@ -483,23 +529,33 @@ async fn writer_task(
     mut outgoing: mpsc::Receiver<Packet>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let peer_hex = hex::encode(&peer.as_ref()[..8]);
+    info!("Writer task started for peer {}", peer_hex);
+    let mut pkt_count = 0u64;
     loop {
         tokio::select! {
             packet = outgoing.recv() => {
                 match packet {
                     Some(pkt) => {
                         let data = pkt.encode()?;
-                        conn.write_to(&data, &peer).await?;
-                        trace!("Sent {} bytes to peer {:?} (port={} stream={})", data.len(), &peer.as_ref()[..8], pkt.port, pkt.stream_id);
+                        pkt_count += 1;
+                        if pkt_count <= 5 || pkt.is_syn() {
+                            info!("Writer sending pkt #{} ({} bytes, flags=0x{:02x}, port={}, stream={}) to {}",
+                                pkt_count, data.len(), pkt.flags, pkt.port, pkt.stream_id, peer_hex);
+                        }
+                        if let Err(e) = conn.write_to(&data, &peer).await {
+                            error!("write_to failed for peer {}: {}", peer_hex, e);
+                            return Err(e.into());
+                        }
                     }
                     None => {
-                        debug!("Outgoing channel closed for peer {:?}", &peer.as_ref()[..8]);
+                        info!("Outgoing channel closed for peer {} (sent {} pkts)", peer_hex, pkt_count);
                         return Ok(());
                     }
                 }
             }
             _ = cancel.cancelled() => {
-                debug!("Writer task cancelled for peer {:?}", &peer.as_ref()[..8]);
+                info!("Writer task cancelled for peer {} (sent {} pkts)", peer_hex, pkt_count);
                 return Ok(());
             }
         }
@@ -561,5 +617,124 @@ mod tests {
 
         // Verify the datagram listener is registered
         assert!(manager.datagram_listeners.read().await.contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn test_connect_removes_stale_connection() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+
+        let peer = Addr::from([42u8; 32]);
+
+        // Manually insert a dead connection
+        let (tx, _rx) = mpsc::channel(256);
+        let dead_conn = Arc::new(Connection::new_initiator(peer, tx));
+        dead_conn.mark_dead().await;
+        assert!(!dead_conn.is_alive());
+        {
+            let mut conns = manager.connections.write().await;
+            conns.insert(peer, dead_conn.clone());
+        }
+        assert_eq!(manager.connection_count().await, 1);
+
+        // connect() should detect the stale connection, remove it, and create a new one
+        let new_conn = manager.connect(peer).await.unwrap();
+        assert!(new_conn.is_alive());
+        assert_eq!(manager.connection_count().await, 1);
+        // The new connection should be a different Arc (not the dead one)
+        assert!(new_conn.is_alive());
+    }
+
+    #[tokio::test]
+    async fn test_connect_reuses_alive_connection() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+
+        let peer = Addr::from([7u8; 32]);
+
+        // First connect creates a new connection
+        let conn1 = manager.connect(peer).await.unwrap();
+        assert!(conn1.is_alive());
+        assert_eq!(manager.connection_count().await, 1);
+
+        // Second connect reuses it
+        let conn2 = manager.connect(peer).await.unwrap();
+        assert_eq!(manager.connection_count().await, 1);
+        // Both should be the same Arc
+        assert!(Arc::ptr_eq(&conn1, &conn2));
+    }
+
+    #[tokio::test]
+    async fn test_connect_handle_removes_stale_connection() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+        let handle = manager.split();
+
+        let peer = Addr::from([99u8; 32]);
+
+        // Manually insert a dead connection via the shared map
+        let (tx, _rx) = mpsc::channel(256);
+        let dead_conn = Arc::new(Connection::new_initiator(peer, tx));
+        dead_conn.mark_dead().await;
+        {
+            let mut conns = handle.connections.write().await;
+            conns.insert(peer, dead_conn);
+        }
+
+        // connect() should remove it and create a fresh one
+        let new_conn = handle.connect(peer).await.unwrap();
+        assert!(new_conn.is_alive());
+    }
+
+    #[tokio::test]
+    async fn test_connect_handle_close_connection() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+        let handle = manager.split();
+
+        let peer = Addr::from([55u8; 32]);
+
+        let connection = handle.connect(peer).await.unwrap();
+        assert!(connection.is_alive());
+
+        // close_connection removes and closes it
+        handle.close_connection(peer).await;
+
+        // The connection map should no longer contain this peer
+        let conns = handle.connections.read().await;
+        assert!(!conns.contains_key(&peer));
+    }
+
+    #[tokio::test]
+    async fn test_connect_handle_close_connection_nonexistent_peer() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+        let handle = manager.split();
+
+        // Should not panic on non-existent peer
+        let peer = Addr::from([0u8; 32]);
+        handle.close_connection(peer).await;
+    }
+
+    #[tokio::test]
+    async fn test_writer_task_exit_marks_connection_dead() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+
+        let peer = Addr::from([11u8; 32]);
+        let connection = manager.connect(peer).await.unwrap();
+        assert!(connection.is_alive());
+
+        // Close the connection — this cancels the token which makes the writer
+        // task exit. After that, mark_dead should also fire. We just verify the
+        // connection is no longer alive after close.
+        connection.close().await;
+        assert!(!connection.is_alive());
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Connection represents a multiplexed connection to a single peer
 ///
@@ -114,19 +114,33 @@ impl Connection {
             streams.insert(key, stream_arc);
         }
 
-        debug!("Opening stream port={} id={} to peer {:?}, timeout: {:?}", port, stream_id, &self.peer, timeout);
+        info!("Opening stream port={} id={} to peer {:?}, timeout: {:?}", port, stream_id, hex::encode(&self.peer.as_ref()[..8]), timeout);
 
         // Send SYN with retransmission until we get SYN-ACK or timeout
         let start = tokio::time::Instant::now();
+        let mut syn_count = 0u32;
         loop {
             // Send SYN packet
-            stream.send_syn().await?;
-            trace!("Sent SYN for port={} stream={}", port, stream_id);
+            match stream.send_syn().await {
+                Ok(()) => {
+                    syn_count += 1;
+                    if syn_count <= 3 || syn_count % 5 == 0 {
+                        info!("Sent SYN #{} for port={} stream={} to {:?}", syn_count, port, stream_id, hex::encode(&self.peer.as_ref()[..8]));
+                    }
+                }
+                Err(e) => {
+                    warn!("send_syn failed for port={} stream={}: {}", port, stream_id, e);
+                    let mut streams = self.streams.write().await;
+                    streams.remove(&key);
+                    return Err(e);
+                }
+            }
 
-            // Wait 500ms for SYN-ACK
+            // Wait 200ms for SYN-ACK
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                // Cleanup: remove stream from registry
+                warn!("open_stream timed out after {} SYN attempts for port={} stream={} to {:?}",
+                    syn_count, port, stream_id, hex::encode(&self.peer.as_ref()[..8]));
                 let mut streams = self.streams.write().await;
                 streams.remove(&key);
                 return Err(Error::Timeout);
@@ -141,13 +155,13 @@ impl Connection {
                 _ = tokio::time::sleep(wait_time) => {
                     // Check if stream is now open
                     if stream.state().await == StreamState::Open {
-                        debug!("Stream port={} id={} opened successfully", port, stream_id);
+                        info!("Stream port={} id={} opened after {} SYN attempts", port, stream_id, syn_count);
                         return Ok(stream);
                     }
                     // Loop continues to retransmit
                 }
                 _ = self.cancel.cancelled() => {
-                    // Cleanup
+                    warn!("open_stream cancelled after {} SYN attempts", syn_count);
                     let mut streams = self.streams.write().await;
                     streams.remove(&key);
                     return Err(Error::ConnectionClosed);
@@ -176,8 +190,12 @@ impl Connection {
         }
     }
 
-    /// Handle an incoming packet and route it to the appropriate stream
-    pub async fn handle_packet(&self, packet: Packet) -> Result<()> {
+    /// Handle an incoming packet and route it to the appropriate stream.
+    ///
+    /// For SYN packets, returns `Ok(true)` if a new stream was created,
+    /// `Ok(false)` if it was a duplicate SYN retransmission.
+    /// For all other packets, returns `Ok(true)` on success.
+    pub async fn handle_packet(&self, packet: Packet) -> Result<bool> {
         let port = packet.port;
         let stream_id = packet.stream_id;
         let key = (port, stream_id);
@@ -206,11 +224,15 @@ impl Connection {
             warn!("Received packet for unknown stream port={} id={} from peer {:?}", port, stream_id, &self.peer);
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    /// Handle a new incoming stream (SYN packet)
-    async fn handle_incoming_stream(&self, packet: Packet) -> Result<()> {
+    /// Handle a new incoming stream (SYN packet).
+    ///
+    /// Returns `Ok(true)` if a new stream was created, `Ok(false)` if it was
+    /// a duplicate SYN (retransmission) — in which case the SYN-ACK is resent
+    /// but no new stream is produced.
+    async fn handle_incoming_stream(&self, packet: Packet) -> Result<bool> {
         let port = packet.port;
         let stream_id = packet.stream_id;
         let key = (port, stream_id);
@@ -227,9 +249,12 @@ impl Connection {
         {
             let streams = self.streams.read().await;
             if streams.contains_key(&key) {
-                // Duplicate SYN, ignore
-                debug!("Duplicate SYN for port={} stream={}", port, stream_id);
-                return Ok(());
+                // Duplicate SYN — resend SYN-ACK (the previous one may have been lost,
+                // which is why the peer is retransmitting).
+                debug!("Duplicate SYN for port={} stream={}, resending SYN-ACK", port, stream_id);
+                let syn_ack = Packet::syn_ack(port, stream_id);
+                let _ = self.outgoing.send(syn_ack).await;
+                return Ok(false);
             }
         }
 
@@ -260,7 +285,7 @@ impl Connection {
 
         debug!("Accepted incoming stream port={} id={} from peer {:?}", port, stream_id, &self.peer);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Allocate a new stream ID
@@ -287,6 +312,16 @@ impl Connection {
         }
 
         debug!("Closed connection to peer {:?}", &self.peer);
+    }
+
+    /// Mark the connection as dead (cancel token set, no streams closed).
+    ///
+    /// Called when the writer task exits — signals that the connection can no
+    /// longer send packets, so `is_alive()` will return `false` and future
+    /// `connect()` calls will create a fresh connection instead of reusing
+    /// this one.
+    pub async fn mark_dead(&self) {
+        self.cancel.cancel();
     }
 
     /// Get the number of active streams
@@ -368,6 +403,56 @@ mod tests {
         assert!(conn.is_alive());
 
         conn.close().await;
+        assert!(!conn.is_alive());
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_cancels_token() {
+        let (tx, _rx) = mpsc::channel(10);
+        let peer = Addr::from([0u8; 32]);
+        let conn = Connection::new_initiator(peer, tx);
+
+        assert!(conn.is_alive());
+        conn.mark_dead().await;
+        assert!(!conn.is_alive());
+    }
+
+    #[tokio::test]
+    async fn test_open_stream_on_dead_connection_returns_error() {
+        let (tx, _rx) = mpsc::channel(10);
+        let peer = Addr::from([0u8; 32]);
+        let conn = Connection::new_initiator(peer, tx);
+
+        conn.mark_dead().await;
+        let result = conn.open_stream(1).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, Error::ConnectionClosed),
+            "Expected ConnectionClosed, got: {:?}", err,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_dead_does_not_close_existing_streams() {
+        // mark_dead only cancels the token, it does not clear the streams map
+        // (unlike close() which clears and aborts them all)
+        let (tx, _rx) = mpsc::channel(10);
+        let peer = Addr::from([0u8; 32]);
+        let conn = Connection::new_initiator(peer, tx);
+
+        // Manually insert a dummy stream into the registry so we can check it persists
+        let stream = crate::stream::Stream::new(1, 1, peer, conn.outgoing.clone());
+        let stream_arc = Arc::new(stream);
+        {
+            let mut streams = conn.streams.write().await;
+            streams.insert((1, 1), stream_arc);
+        }
+        assert_eq!(conn.stream_count().await, 1);
+
+        conn.mark_dead().await;
+        // Streams are NOT cleared — only the cancel token is set
+        assert_eq!(conn.stream_count().await, 1);
         assert!(!conn.is_alive());
     }
 

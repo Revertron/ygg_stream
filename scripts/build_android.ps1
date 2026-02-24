@@ -2,7 +2,7 @@
 # and generate UniFFI Kotlin bindings.
 #
 # Prerequisites (run once):
-#   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+#   rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 #   cargo install cargo-ndk
 #   Install Android NDK via Android Studio → SDK Manager → NDK (Side by side)
 #
@@ -12,6 +12,7 @@
 # Outputs:
 #   jniLibs/arm64-v8a/libygg_stream.so
 #   jniLibs/armeabi-v7a/libygg_stream.so
+#   jniLibs/x86/libygg_stream.so
 #   jniLibs/x86_64/libygg_stream.so
 #   kotlin-bindings/uniffi/ygg_stream/ygg_stream.kt
 
@@ -57,6 +58,7 @@ $env:ANDROID_NDK_HOME = $NdkRoot
 $Targets = @(
     @{ Triple = "aarch64-linux-android";   Abi = "arm64-v8a"    },
     @{ Triple = "armv7-linux-androideabi"; Abi = "armeabi-v7a"  },
+    @{ Triple = "i686-linux-android";     Abi = "x86"          },
     @{ Triple = "x86_64-linux-android";   Abi = "x86_64"       }
 )
 

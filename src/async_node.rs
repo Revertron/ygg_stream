@@ -28,12 +28,14 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
@@ -156,6 +158,10 @@ impl AsyncConn {
 pub struct AsyncNode {
     core: Arc<Core>,
     handle: ConnectHandle,
+    /// Persistent stream listeners, keyed by port.
+    stream_listeners: Mutex<HashMap<u16, Listener>>,
+    /// Persistent datagram listeners, keyed by port.
+    datagram_listeners: Mutex<HashMap<u16, DatagramListener>>,
 }
 
 impl AsyncNode {
@@ -175,10 +181,7 @@ impl AsyncNode {
     }
 
     /// Create a node with a specific 32-byte signing key and a list of peers.
-    pub async fn new_with_key(
-        signing_key_bytes: &[u8],
-        peers: Vec<String>,
-    ) -> Result<Self, String> {
+    pub async fn new_with_key(signing_key_bytes: &[u8], peers: Vec<String>) -> Result<Self, String> {
         let bytes: [u8; 32] = signing_key_bytes
             .try_into()
             .map_err(|_| "signing key must be exactly 32 bytes".to_string())?;
@@ -188,10 +191,7 @@ impl AsyncNode {
         Self::from_key_and_config(signing_key, config).await
     }
 
-    async fn from_key_and_config(
-        signing_key: SigningKey,
-        config: Config,
-    ) -> Result<Self, String> {
+    async fn from_key_and_config(signing_key: SigningKey, config: Config) -> Result<Self, String> {
         let core = Core::new(signing_key, config);
         core.init_links().await;
         core.start().await;
@@ -202,7 +202,12 @@ impl AsyncNode {
         let manager = StreamManager::new(core.packet_conn());
         let handle = manager.split();
 
-        Ok(Self { core, handle })
+        Ok(Self {
+            core,
+            handle,
+            stream_listeners: Mutex::new(HashMap::new()),
+            datagram_listeners: Mutex::new(HashMap::new()),
+        })
     }
 
     // ── identity ──────────────────────────────────────────────────────────
@@ -218,6 +223,9 @@ impl AsyncNode {
     ///
     /// Reuses an existing ironwood session if one exists; otherwise establishes
     /// a new one.
+    ///
+    /// If the cached connection turns out to be stale (writer task dead),
+    /// it is removed and a fresh connection is created automatically.
     pub async fn connect(&self, public_key: &[u8], port: u16) -> Result<AsyncConn, String> {
         if public_key.len() != 32 {
             return Err("public_key must be exactly 32 bytes".to_string());
@@ -227,19 +235,35 @@ impl AsyncNode {
         let addr = ironwood::Addr::from(key);
 
         let connection = self.handle.connect(addr).await.map_err(|e| e.to_string())?;
-        let stream = connection
-            .open_stream(port)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        Ok(AsyncConn::new(stream, public_key.to_vec(), port))
+        match connection.open_stream(port).await {
+            Ok(stream) => Ok(AsyncConn::new(stream, public_key.to_vec(), port)),
+            Err(e) => {
+                // Connection may be stale — close it and retry once with a fresh one.
+                tracing::warn!(
+                    "open_stream failed on cached connection to {:?}: {}, retrying with fresh connection",
+                    hex::encode(&addr.as_ref()[..8]), e
+                );
+                self.handle.close_connection(addr).await;
+                let connection = self.handle.connect(addr).await.map_err(|e| e.to_string())?;
+                let stream = connection
+                    .open_stream(port)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(AsyncConn::new(stream, public_key.to_vec(), port))
+            }
+        }
     }
 
-    /// Register a listener for the given port and await an incoming stream.
+    /// Await an incoming stream on the given port.
     ///
-    /// This is a convenience that combines `listen` + single `accept`.
+    /// Creates a listener on first call and reuses it for subsequent calls.
     pub async fn accept(&self, port: u16) -> Result<AsyncConn, String> {
-        let mut listener = self.handle.listen(port).await;
+        let mut listeners = self.stream_listeners.lock().await;
+        let listener = if !listeners.contains_key(&port) {
+            listeners.entry(port).or_insert(self.handle.listen(port).await)
+        } else {
+            listeners.get_mut(&port).unwrap()
+        };
         let stream = listener.accept().await.map_err(|e| e.to_string())?;
         let public_key = stream.peer_addr().0.to_vec();
         Ok(AsyncConn::new(stream, public_key, port))
@@ -257,12 +281,7 @@ impl AsyncNode {
     /// Send a connectionless datagram to a peer on the given port.
     ///
     /// No handshake, no flow control, no ordering guarantees.
-    pub async fn send_datagram(
-        &self,
-        public_key: &[u8],
-        port: u16,
-        data: &[u8],
-    ) -> Result<(), String> {
+    pub async fn send_datagram(&self,public_key: &[u8], port: u16, data: &[u8]) -> Result<(), String> {
         if public_key.len() != 32 {
             return Err("public_key must be exactly 32 bytes".to_string());
         }
@@ -282,13 +301,47 @@ impl AsyncNode {
         self.handle.listen_datagram(port).await
     }
 
-    /// Register a listener and await one datagram.
+    /// Await one datagram on the given port.
     ///
+    /// Creates a listener on first call and reuses it for subsequent calls.
     /// Returns `(data, sender_public_key)`.
     pub async fn recv_datagram(&self, port: u16) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let mut listener = self.handle.listen_datagram(port).await;
+        let mut listeners = self.datagram_listeners.lock().await;
+        let listener = if !listeners.contains_key(&port) {
+            listeners.entry(port).or_insert(self.handle.listen_datagram(port).await)
+        } else {
+            listeners.get_mut(&port).unwrap()
+        };
         let (data, addr) = listener.recv().await.map_err(|e| e.to_string())?;
         Ok((data, addr.0.to_vec()))
+    }
+
+    /// Await one datagram on the given port with a timeout in milliseconds.
+    ///
+    /// Creates a listener on first call and reuses it for subsequent calls.
+    /// Returns `(data, sender_public_key)`, or an error on timeout.
+    pub async fn recv_datagram_with_timeout(&self,port: u16, timeout_ms: i64) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let mut listeners = self.datagram_listeners.lock().await;
+        let listener = if !listeners.contains_key(&port) {
+            listeners.entry(port).or_insert(self.handle.listen_datagram(port).await)
+        } else {
+            listeners.get_mut(&port).unwrap()
+        };
+        if timeout_ms <= 0 {
+            let (data, addr) = listener.recv().await.map_err(|e| e.to_string())?;
+            Ok((data, addr.0.to_vec()))
+        } else {
+            match tokio::time::timeout(
+                Duration::from_millis(timeout_ms as u64),
+                listener.recv(),
+            )
+            .await
+            {
+                Ok(Ok((data, addr))) => Ok((data, addr.0.to_vec())),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("deadline exceeded".to_string()),
+            }
+        }
     }
 
     // ── peer management ───────────────────────────────────────────────────
