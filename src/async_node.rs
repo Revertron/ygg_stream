@@ -99,11 +99,7 @@ impl AsyncConn {
 
     /// Read with timeout (milliseconds). Returns `Err("timeout")` on expiry.
     /// `timeout_ms ≤ 0` behaves like [`read`](Self::read).
-    pub async fn read_with_timeout(
-        &self,
-        buf: &mut [u8],
-        timeout_ms: i64,
-    ) -> Result<usize, String> {
+    pub async fn read_with_timeout(&self,buf: &mut [u8], timeout_ms: i64) -> Result<usize, String> {
         if timeout_ms <= 0 {
             return self.read(buf).await;
         }
@@ -115,36 +111,38 @@ impl AsyncConn {
             .map_err(|e| e.to_string())
     }
 
-    /// Write `buf` to the stream. Returns the number of bytes written.
+    /// Write all of `buf` to the stream. Loops internally until every byte is sent.
     pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
         let mut s = self.stream.clone();
-        AsyncWriteExt::write(&mut s, buf)
+        AsyncWriteExt::write_all(&mut s, buf)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        s.flush().await.map_err(|e| e.to_string())?;
+        Ok(buf.len())
     }
 
-    /// Write with timeout (milliseconds). Returns `Err("timeout")` on expiry.
+    /// Write all of `buf` with timeout (milliseconds). Returns `Err("timeout")` on expiry.
     /// `timeout_ms ≤ 0` behaves like [`write`](Self::write).
-    pub async fn write_with_timeout(
-        &self,
-        buf: &[u8],
-        timeout_ms: i64,
-    ) -> Result<usize, String> {
+    pub async fn write_with_timeout(&self, buf: &[u8], timeout_ms: i64) -> Result<usize, String> {
         if timeout_ms <= 0 {
             return self.write(buf).await;
         }
         let dur = Duration::from_millis(timeout_ms as u64);
         let mut s = self.stream.clone();
-        tokio::time::timeout(dur, AsyncWriteExt::write(&mut s, buf))
+        tokio::time::timeout(dur, AsyncWriteExt::write_all(&mut s, buf))
             .await
             .map_err(|_| "timeout".to_string())?
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(buf.len())
     }
 
-    /// Close the stream gracefully.
+    /// Close the stream gracefully (with a 5-second timeout).
+    ///
+    /// Sends FIN and waits up to 5 s for the peer's FIN.  If the peer is
+    /// unreachable or doesn't respond in time, the stream is abandoned.
     pub async fn close(&self) {
         let mut s = self.stream.clone();
-        let _ = s.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.shutdown()).await;
     }
 }
 
@@ -405,6 +403,11 @@ impl AsyncNode {
         serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Subscribe to peer connect/disconnect events from the underlying core.
+    pub fn subscribe_peer_events(&self) -> tokio::sync::broadcast::Receiver<yggdrasil::links::PeerEvent> {
+        self.core.as_ref().subscribe_peer_events()
+    }
+
     /// Cached routing paths as a JSON array.
     ///
     /// Each element contains `key`, `address`, `path` (port sequence), `sequence`.
@@ -449,6 +452,14 @@ impl AsyncNode {
 
     /// Shut down the node and all background tasks.
     pub async fn close(&self) {
+        // Close the stream manager first — stops reader/writer tasks,
+        // closes every connection (freeing stream buffers), and drops listeners.
+        self.handle.close_all().await;
+
+        // Clear local listener caches.
+        self.stream_listeners.lock().await.clear();
+        self.datagram_listeners.lock().await.clear();
+
         let _ = self.core.close().await;
     }
 }

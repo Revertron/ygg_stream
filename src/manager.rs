@@ -5,7 +5,9 @@ use crate::stream::Stream;
 use ironwood::{Addr, EncryptedPacketConn, PacketConn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -349,6 +351,27 @@ impl ConnectHandle {
             c.close().await;
         }
     }
+
+    /// Shut down all connections and clear all listener maps.
+    ///
+    /// Cancels the reader/writer tasks, closes every cached connection (freeing
+    /// their stream buffers), and drops listener channel senders.
+    pub async fn close_all(&self) {
+        self.cancel.cancel();
+
+        // Close and remove all cached connections.
+        let conns: Vec<_> = {
+            let mut guard = self.connections.write().await;
+            guard.drain().map(|(_, c)| c).collect()
+        };
+        for c in conns {
+            c.close().await;
+        }
+
+        // Drop listener senders so receiver sides see channel-closed.
+        self.listeners.write().await.clear();
+        self.datagram_listeners.write().await.clear();
+    }
 }
 
 /// Background reader task
@@ -369,7 +392,7 @@ async fn reader_task(
         tokio::select! {
             result = conn.read_from(&mut buf) => {
                 let (n, peer) = result?;
-                debug!("Received {} bytes from peer {}", n, hex::encode(&peer.as_ref()[..8]));
+                trace!("Received {} bytes from peer {}", n, hex::encode(&peer.as_ref()[..8]));
 
                 // Decode packet
                 let packet = match Packet::decode(&buf[..n]) {
@@ -540,7 +563,7 @@ async fn writer_task(
                         let data = pkt.encode()?;
                         pkt_count += 1;
                         if pkt_count <= 5 || pkt.is_syn() {
-                            info!("Writer sending pkt #{} ({} bytes, flags=0x{:02x}, port={}, stream={}) to {}",
+                            debug!("Writer sending pkt #{} ({} bytes, flags=0x{:02x}, port={}, stream={}) to {}",
                                 pkt_count, data.len(), pkt.flags, pkt.port, pkt.stream_id, peer_hex);
                         }
                         if let Err(e) = conn.write_to(&data, &peer).await {
@@ -559,6 +582,7 @@ async fn writer_task(
                 return Ok(());
             }
         }
+        sleep(Duration::from_millis(1)).await;
     }
 }
 

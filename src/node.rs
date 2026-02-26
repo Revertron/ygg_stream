@@ -96,8 +96,8 @@ impl Conn {
 /// All methods are **blocking** (backed by an internal `tokio::Runtime`),
 /// so they can be called directly from Java/Kotlin without any async plumbing.
 pub struct Node {
-    inner: AsyncNode,
-    rt: Arc<Runtime>,
+    pub(crate) inner: Arc<AsyncNode>,
+    pub(crate) rt: Arc<Runtime>,
 }
 
 impl Node {
@@ -110,14 +110,14 @@ impl Node {
     pub fn new(peer_addr: &str) -> Result<Self, String> {
         let rt = Arc::new(Runtime::new().map_err(|e| e.to_string())?);
         let inner = rt.block_on(AsyncNode::new(peer_addr))?;
-        Ok(Self { inner, rt })
+        Ok(Self { inner: Arc::new(inner), rt })
     }
 
     /// Create a node with a specific 32-byte signing key and a list of peers.
     pub fn new_with_key(signing_key_bytes: &[u8], peers: Vec<String>) -> Result<Self, String> {
         let rt = Arc::new(Runtime::new().map_err(|e| e.to_string())?);
         let inner = rt.block_on(AsyncNode::new_with_key(signing_key_bytes, peers))?;
-        Ok(Self { inner, rt })
+        Ok(Self { inner: Arc::new(inner), rt })
     }
 
     // ── identity ──────────────────────────────────────────────────────────

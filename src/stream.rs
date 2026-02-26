@@ -1,10 +1,10 @@
 use crate::error::{Error, Result};
-use crate::protocol::{Packet, DEFAULT_WINDOW_SIZE};
+use crate::protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_DATA_SIZE};
 use ironwood::Addr;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -41,10 +41,10 @@ pub struct Stream {
     recv_buf: Arc<Mutex<VecDeque<u8>>>,
 
     /// Send window (bytes we can send based on peer's last ACK)
-    send_window: Arc<AtomicUsize>,
+    send_window: Arc<AtomicU32>,
 
     /// Receive window (bytes we can receive - our buffer space)
-    recv_window: Arc<AtomicUsize>,
+    recv_window: Arc<AtomicU32>,
 
     /// Channel to send outgoing packets
     outgoing: mpsc::Sender<Packet>,
@@ -70,8 +70,8 @@ impl Stream {
             id,
             peer,
             recv_buf: Arc::new(Mutex::new(VecDeque::new())),
-            send_window: Arc::new(AtomicUsize::new(DEFAULT_WINDOW_SIZE)),
-            recv_window: Arc::new(AtomicUsize::new(DEFAULT_WINDOW_SIZE)),
+            send_window: Arc::new(AtomicU32::new(DEFAULT_WINDOW_SIZE)),
+            recv_window: Arc::new(AtomicU32::new(DEFAULT_WINDOW_SIZE)),
             outgoing,
             state: Arc::new(Mutex::new(StreamState::Opening)),
             read_notify: Arc::new(Notify::new()),
@@ -166,7 +166,7 @@ impl Stream {
                     self.read_notify.notify_one();
 
                     // Update our receive window
-                    let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len());
+                    let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len() as u32);
                     self.recv_window.store(available, Ordering::Release);
 
                     // Send ACK with updated window
@@ -266,8 +266,7 @@ impl Stream {
 }
 
 impl AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         // Try to lock recv_buf
@@ -284,11 +283,25 @@ impl AsyncRead for Stream {
         // Check if we have data available
         if !recv_buf.is_empty() {
             let to_read = std::cmp::min(buf.remaining(), recv_buf.len());
-            let data: Vec<u8> = recv_buf.drain(..to_read).collect();
-            buf.put_slice(&data);
+
+            // Copy directly from VecDeque slices to avoid an intermediate Vec allocation.
+            let (head, tail) = recv_buf.as_slices();
+            if to_read <= head.len() {
+                buf.put_slice(&head[..to_read]);
+            } else {
+                buf.put_slice(head);
+                buf.put_slice(&tail[..to_read - head.len()]);
+            }
+            drop(recv_buf.drain(..to_read));
+
+            // Shrink the VecDeque when fully drained to release memory
+            // after large transfers.
+            if recv_buf.is_empty() {
+                recv_buf.shrink_to_fit();
+            }
 
             // Update receive window
-            let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len());
+            let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len() as u32);
             this.recv_window.store(available, Ordering::Release);
 
             return Poll::Ready(Ok(()));
@@ -323,8 +336,7 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
         // Check stream state
@@ -367,24 +379,37 @@ impl AsyncWrite for Stream {
             return Poll::Pending;
         }
 
-        // Send what we can within the window
-        let to_send = std::cmp::min(buf.len(), window);
+        // Send what we can within the window, clamped to MAX_DATA_SIZE per packet
+        let to_send = buf.len().min(window as usize).min(MAX_DATA_SIZE);
         let data = buf[..to_send].to_vec();
         let window_after = this.recv_window.load(Ordering::Acquire);
         let packet = Packet::data_ack(this.port, this.id, data, window_after);
 
         // Decrease send window
-        this.send_window.fetch_sub(to_send, Ordering::Release);
+        this.send_window.fetch_sub(to_send as u32, Ordering::Release);
 
-        // Send packet asynchronously
-        let outgoing = this.outgoing.clone();
-        let waker = cx.waker().clone();
-        tokio::spawn(async move {
-            let _ = outgoing.send(packet).await;
-            waker.wake();
-        });
-
-        Poll::Ready(Ok(to_send))
+        // Send packet synchronously to preserve ordering.
+        match this.outgoing.try_send(packet) {
+            Ok(()) => Poll::Ready(Ok(to_send)),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel full — undo the window decrement and retry later
+                this.send_window.fetch_add(to_send as u32, Ordering::Release);
+                let waker = cx.waker().clone();
+                let outgoing = this.outgoing.clone();
+                tokio::spawn(async move {
+                    // Wait until the channel has capacity, then wake
+                    let _ = outgoing.reserve().await;
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "outgoing channel closed",
+                )))
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -405,10 +430,7 @@ impl AsyncWrite for Stream {
 
                     // Send FIN packet
                     let packet = Packet::fin(this.port, this.id);
-                    let outgoing = this.outgoing.clone();
-                    tokio::spawn(async move {
-                        let _ = outgoing.send(packet).await;
-                    });
+                    let _ = this.outgoing.try_send(packet);
                 }
                 current
             }
@@ -535,7 +557,7 @@ mod tests {
             stream_id: 1,
             flags: FLAG_ACK | FLAG_SYN,
             data: Vec::new(),
-            window: 1024,
+            window: 1024u32,
         };
         stream.handle_packet(ack).await.unwrap();
 

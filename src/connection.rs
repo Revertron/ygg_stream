@@ -212,13 +212,23 @@ impl Connection {
         };
 
         if let Some(stream) = stream {
-            stream.handle_packet(packet).await?;
+            let result = stream.handle_packet(packet).await;
 
-            // Remove stream if closed
+            // Always remove closed streams (handles normal FIN and RST).
+            // This must happen regardless of whether handle_packet returned an
+            // error so that stale entries do not block future streams with the
+            // same (port, stream_id) key.
             if stream.is_closed().await {
                 let mut streams = self.streams.write().await;
                 streams.remove(&key);
                 trace!("Removed closed stream port={} id={}", port, stream_id);
+            }
+
+            // StreamReset is a normal protocol event; swallow it here.
+            // Propagate any other errors.
+            match result {
+                Err(crate::error::Error::StreamReset) | Ok(()) => {}
+                Err(e) => return Err(e),
             }
         } else {
             warn!("Received packet for unknown stream port={} id={} from peer {:?}", port, stream_id, &self.peer);
@@ -245,16 +255,23 @@ impl Connection {
             return Err(Error::Protocol(format!("Received even stream ID {} from peer (we are acceptor)", stream_id)));
         }
 
-        // Check if stream already exists
+        // Check if a stream with this key already exists.
+        // Use a write lock so the check-and-remove is atomic.
         {
-            let streams = self.streams.read().await;
-            if streams.contains_key(&key) {
-                // Duplicate SYN — resend SYN-ACK (the previous one may have been lost,
-                // which is why the peer is retransmitting).
-                debug!("Duplicate SYN for port={} stream={}, resending SYN-ACK", port, stream_id);
-                let syn_ack = Packet::syn_ack(port, stream_id);
-                let _ = self.outgoing.send(syn_ack).await;
-                return Ok(false);
+            let mut streams = self.streams.write().await;
+            if let Some(existing) = streams.get(&key) {
+                if existing.state().await != StreamState::Closed {
+                    // Live stream — genuine duplicate SYN retransmission.
+                    // Resend SYN-ACK in case the original was lost.
+                    debug!("Duplicate SYN for port={} stream={}, resending SYN-ACK", port, stream_id);
+                    drop(streams);
+                    let syn_ack = Packet::syn_ack(port, stream_id);
+                    let _ = self.outgoing.send(syn_ack).await;
+                    return Ok(false);
+                }
+                // Stale closed entry — remove it and fall through to create a new stream.
+                debug!("Stale closed stream for port={} stream={}, replacing with new stream", port, stream_id);
+                streams.remove(&key);
             }
         }
 
@@ -297,9 +314,8 @@ impl Connection {
 
     /// Close the connection and all streams
     pub async fn close(&self) {
-        self.cancel.cancel();
-
-        // Close all streams
+        // Collect and clear streams before cancelling so the writer task is
+        // still running when RST packets are enqueued.
         let streams = {
             let mut streams_lock = self.streams.write().await;
             let current_streams: Vec<_> = streams_lock.values().cloned().collect();
@@ -310,6 +326,9 @@ impl Connection {
         for stream in streams {
             let _ = stream.abort().await;
         }
+
+        // Cancel after RSTs are in the outgoing channel.
+        self.cancel.cancel();
 
         debug!("Closed connection to peer {:?}", &self.peer);
     }

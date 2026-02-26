@@ -9,22 +9,25 @@ pub const FLAG_RST: u8 = 0x08; // Reset stream (abort)
 pub const FLAG_DGRAM: u8 = 0x10; // Connectionless datagram
 
 /// Default flow control window size (256 KB)
-pub const DEFAULT_WINDOW_SIZE: usize = 256 * 1024;
+pub const DEFAULT_WINDOW_SIZE: u32 = 256 * 1024;
 
 /// Maximum packet size (64 KB - 1 byte)
 pub const MAX_PACKET_SIZE: usize = 65535;
 
-/// Maximum data payload per packet (accounting for 7-byte header)
-pub const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - 7;
+/// Maximum data payload per packet (accounting for 11-byte header)
+pub const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - HEADER_YGGDRASIL;
 
-/// Packet header size (stream_id + flags + length)
-pub const HEADER_SIZE: usize = 7;
+/// Packet header size (port+stream_id + flags + window + length)
+pub const HEADER_SIZE: usize = 11;
+
+/// Yggdrasil overhead
+pub const HEADER_YGGDRASIL: usize = 131;
 
 /// Protocol packet
 ///
 /// Wire format:
 /// ```text
-/// [port:u16 << 16 | stream_id:u16 : u32][flags: u8][length: u16][data: bytes]
+/// [port:u16 << 16 | stream_id:u16 : u32][flags: u8][window: u32][length: u16][data: bytes]
 /// ```
 ///
 /// The 4-byte combined field encodes `(port << 16) | stream_id`.
@@ -42,9 +45,8 @@ pub struct Packet {
     /// Data payload
     pub data: Vec<u8>,
 
-    /// Receiver's available window size (for flow control)
-    /// Encoded in flags byte when ACK flag is set
-    pub window: usize,
+    /// Receiver's available window size (for flow control), transmitted on the wire
+    pub window: u32,
 }
 
 impl Packet {
@@ -75,7 +77,7 @@ impl Packet {
     }
 
     /// Create a data + ACK packet
-    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, window: usize) -> Self {
+    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, window: u32) -> Self {
         Self {
             port,
             stream_id,
@@ -101,7 +103,7 @@ impl Packet {
     }
 
     /// Create an ACK packet with window update
-    pub fn ack(port: u16, stream_id: u16, window: usize) -> Self {
+    pub fn ack(port: u16, stream_id: u16, window: u32) -> Self {
         Self {
             port,
             stream_id,
@@ -138,7 +140,7 @@ impl Packet {
 
     /// Encode packet to bytes
     ///
-    /// Format: [(port << 16 | stream_id): u32][flags: u8][length: u16][data]
+    /// Format: [(port << 16 | stream_id): u32][flags: u8][window: u32][length: u16][data]
     pub fn encode(&self) -> Result<Vec<u8>> {
         let data_len = self.data.len();
         if data_len > MAX_DATA_SIZE {
@@ -153,6 +155,9 @@ impl Packet {
 
         // Write flags (1 byte)
         buf.put_u8(self.flags);
+
+        // Write window (4 bytes, big-endian)
+        buf.put_u32(self.window);
 
         // Write length (2 bytes, big-endian)
         buf.put_u16(data_len as u16);
@@ -184,6 +189,9 @@ impl Packet {
         // Read flags (1 byte)
         let flags = cursor.get_u8();
 
+        // Read window (4 bytes, big-endian)
+        let window = cursor.get_u32();
+
         // Read length (2 bytes, big-endian)
         let length = cursor.get_u16() as usize;
 
@@ -204,7 +212,7 @@ impl Packet {
             stream_id,
             flags,
             data,
-            window: DEFAULT_WINDOW_SIZE,
+            window,
         })
     }
 }
@@ -312,6 +320,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u32(1); // combined port+stream_id
         buf.put_u8(0); // flags
+        buf.put_u32(0); // window
         buf.put_u16(100); // length says 100 bytes
         buf.put_slice(b"short"); // but only 5 bytes of data
 

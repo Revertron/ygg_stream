@@ -10,7 +10,7 @@
 //!   The Kotlin wrapper copies the returned bytes into the caller's buffer.
 
 use std::sync::{Arc, Once};
-
+use tokio::sync::broadcast::error::RecvError;
 use crate::node::{Conn, Node};
 
 /// Initialize tracing (Android → logcat, other platforms → stderr).
@@ -68,7 +68,9 @@ pub struct FfiDatagram {
 /// Wraps [`Node`] so that the blocking API is accessible from Kotlin/Swift
 /// via the generated UniFFI bindings.
 #[derive(uniffi::Object)]
-pub struct FfiNode(Node);
+pub struct FfiNode {
+    node: Node,
+}
 
 #[uniffi::export]
 impl FfiNode {
@@ -79,7 +81,7 @@ impl FfiNode {
     pub fn new_(peer_addr: String) -> Result<Arc<FfiNode>, YggError> {
         //init_tracing();
         Node::new(&peer_addr)
-            .map(|m| Arc::new(FfiNode(m)))
+            .map(|m| Arc::new(FfiNode { node: m }))
             .map_err(YggError::Generic)
     }
 
@@ -88,18 +90,18 @@ impl FfiNode {
     pub fn new_with_key(key_bytes: Vec<u8>, peers: Vec<String>) -> Result<Arc<FfiNode>, YggError> {
         //init_tracing();
         Node::new_with_key(&key_bytes, peers)
-            .map(|m| Arc::new(FfiNode(m)))
+            .map(|m| Arc::new(FfiNode { node: m }))
             .map_err(YggError::Generic)
     }
 
     /// Local node's 32-byte ed25519 public key.
     pub fn public_key(&self) -> Vec<u8> {
-        self.0.public_key()
+        self.node.public_key()
     }
 
     /// Open a stream to the peer identified by its 32-byte public key on the given port.
     pub fn connect(&self, public_key: Vec<u8>, port: u16) -> Result<Arc<FfiConn>, YggError> {
-        self.0
+        self.node
             .connect(&public_key, port)
             .map(|c| Arc::new(FfiConn(c)))
             .map_err(YggError::Generic)
@@ -107,7 +109,7 @@ impl FfiNode {
 
     /// Block until an incoming stream arrives on the given port.
     pub fn accept(&self, port: u16) -> Result<Arc<FfiConn>, YggError> {
-        self.0
+        self.node
             .accept(port)
             .map(|c| Arc::new(FfiConn(c)))
             .map_err(YggError::Generic)
@@ -115,42 +117,42 @@ impl FfiNode {
 
     /// Add a peer by URI (e.g. `"tcp://1.2.3.4:1234"` or `"tls://…"`).
     pub fn add_peer(&self, addr: String) -> Result<(), YggError> {
-        self.0.add_peer(&addr).map_err(YggError::Generic)
+        self.node.add_peer(&addr).map_err(YggError::Generic)
     }
 
     /// Remove a peer by URI.
     pub fn remove_peer(&self, addr: String) -> Result<(), YggError> {
-        self.0.remove_peer(&addr).map_err(YggError::Generic)
+        self.node.remove_peer(&addr).map_err(YggError::Generic)
     }
 
     /// Wake all sleeping peer reconnect loops so they retry immediately.
     pub fn retry_peers_now(&self) {
-        self.0.retry_peers_now();
+        self.node.retry_peers_now();
     }
 
     /// Force-close the cached stream connection to the peer with the given public key.
     pub fn close_connection(&self, public_key: Vec<u8>) {
-        self.0.close_connection(&public_key);
+        self.node.close_connection(&public_key);
     }
 
     /// Peer list as a JSON array.
     pub fn get_peers_json(&self) -> String {
-        self.0.get_peers_json()
+        self.node.get_peers_json()
     }
 
     /// Cached routing paths as a JSON array.
     pub fn get_paths_json(&self) -> String {
-        self.0.get_paths_json()
+        self.node.get_paths_json()
     }
 
     /// Spanning-tree entries as a JSON array.
     pub fn get_tree_json(&self) -> String {
-        self.0.get_tree_json()
+        self.node.get_tree_json()
     }
 
     /// Send a connectionless datagram to a peer on the given port.
     pub fn send_datagram(&self,public_key: Vec<u8>, port: u16, data: Vec<u8>) -> Result<(), YggError> {
-        self.0
+        self.node
             .send_datagram(&public_key, port, &data)
             .map_err(YggError::Generic)
     }
@@ -160,7 +162,7 @@ impl FfiNode {
     /// Creates a listener on first call and reuses it for subsequent calls.
     pub fn recv_datagram(&self, port: u16) -> Result<FfiDatagram, YggError> {
         let (data, public_key) = self
-            .0
+            .node
             .recv_datagram(port)
             .map_err(YggError::Generic)?;
         Ok(FfiDatagram { data, public_key })
@@ -172,12 +174,37 @@ impl FfiNode {
     /// Creates a listener on first call and reuses it for subsequent calls.
     pub fn recv_datagram_with_timeout(&self, port: u16, timeout_ms: i64) -> Result<FfiDatagram, YggError> {
         let (data, public_key) = self
-            .0
+            .node
             .recv_datagram_with_timeout(port, timeout_ms)
             .map_err(YggError::Generic)?;
         Ok(FfiDatagram { data, public_key })
     }
 
+    /// Block until a peer connects or disconnects, then return the updated peer list as JSON.
+    ///
+    /// `timeout_ms ≤ 0` means no timeout. Returns `Err("timeout")` on expiry.
+    /// Call this in a loop on a background thread/coroutine to react to peer changes.
+    pub fn wait_peer_change(&self, timeout_ms: i64) -> Result<String, YggError> {
+        self.node.rt.block_on(async {
+            let mut rx = self.node.inner.subscribe_peer_events();
+            let event = if timeout_ms > 0 {
+                let dur = std::time::Duration::from_millis(timeout_ms as u64);
+                match tokio::time::timeout(dur, rx.recv()).await {
+                    Ok(data) => data,
+                    Err(_) => return Ok(self.node.inner.get_peers_json().await)
+                }
+            } else {
+                rx.recv().await
+            };
+            match event {
+                Ok(_) | Err(RecvError::Lagged(_)) => {
+                    Ok(self.node.inner.get_peers_json().await)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .map_err(YggError::Generic)
+    }
 }
 
 // Closing the FfiNode is triggered by UniFFI's Disposable.close() → destroy()
@@ -185,7 +212,7 @@ impl FfiNode {
 // (which would conflict with the Disposable-generated `fun close()` in Kotlin).
 impl Drop for FfiNode {
     fn drop(&mut self) {
-        self.0.close();
+        self.node.close();
     }
 }
 
@@ -218,7 +245,7 @@ impl FfiConn {
     /// (UniFFI cannot express mutable byte-array arguments for in-place fills).
     ///
     /// `timeout_ms ≤ 0` means no timeout.
-    pub fn read_with_timeout(&self,max_bytes: u64, timeout_ms: i64) -> Result<Vec<u8>, YggError> {
+    pub fn read_with_timeout(&self, max_bytes: u64, timeout_ms: i64) -> Result<Vec<u8>, YggError> {
         let mut buf = vec![0u8; max_bytes as usize];
         let n = if timeout_ms <= 0 {
             self.0.read(&mut buf).map_err(YggError::Generic)?
@@ -227,8 +254,9 @@ impl FfiConn {
                 .read_with_timeout(&mut buf, timeout_ms)
                 .map_err(YggError::Generic)?
         };
-        buf.truncate(n);
-        Ok(buf)
+        // Return a right-sized Vec instead of a 64KB allocation truncated to n bytes.
+        // truncate() keeps the original capacity; this copies only the bytes we need.
+        Ok(buf[..n].to_vec())
     }
 
     /// Write `data` to the stream with an optional timeout.

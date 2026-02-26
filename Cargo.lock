@@ -1004,7 +1004,6 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "ironwood"
 version = "0.1.1"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=7d46bb04#7d46bb04aa54b78cee5e43594ee685d3c750e777"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2272,6 +2271,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "uniffi_bindgen",
+ "uniffi_build",
  "uniffi_core",
  "uniffi_macros",
  "uniffi_pipeline",
@@ -2301,6 +2301,17 @@ dependencies = [
  "uniffi_meta",
  "uniffi_pipeline",
  "uniffi_udl",
+]
+
+[[package]]
+name = "uniffi_build"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b78fd9271a4c2e85bd2c266c5a9ede1fac676eb39fd77f636c27eaf67426fd5f"
+dependencies = [
+ "anyhow",
+ "camino",
+ "uniffi_bindgen",
 ]
 
 [[package]]
@@ -3025,7 +3036,6 @@ dependencies = [
 [[package]]
 name = "yggdrasil"
 version = "0.1.1"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=7d46bb04#7d46bb04aa54b78cee5e43594ee685d3c750e777"
 dependencies = [
  "blake2",
  "comfy-table",

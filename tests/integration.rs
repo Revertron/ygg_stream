@@ -3,7 +3,9 @@
 use ed25519_dalek::SigningKey;
 use ironwood::PacketConn;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::sleep;
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 use ygg_stream::StreamManager;
@@ -264,6 +266,8 @@ async fn test_tcp_stale_connection_reconnect() {
     // Kill the first connection by closing it
     connection2a.close().await;
     assert!(!connection2a.is_alive());
+
+    sleep(Duration::from_secs(2)).await;
 
     // Reconnect — connect() should create a fresh connection
     let connection2b = manager2.connect(addr1).await.unwrap();
