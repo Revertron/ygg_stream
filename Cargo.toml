@@ -47,3 +47,7 @@ path = "examples/client.rs"
 [[example]]
 name = "full_node"
 path = "examples/full_node.rs"
+
+[[example]]
+name = "tcp_proxy"
+path = "examples/tcp_proxy.rs"

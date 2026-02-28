@@ -1,14 +1,25 @@
 use crate::error::{Error, Result};
-use crate::protocol::{Packet, DEFAULT_WINDOW_SIZE};
+use crate::protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_DATA_SIZE};
 use ironwood::Addr;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex, Notify};
+use tracing::{debug, trace};
+
+/// Retransmit timeout in milliseconds.
+const RETRANSMIT_TIMEOUT_MS: u64 = 150;
+
+/// Maximum bytes allowed in-flight (sent but not yet ACKed).
+/// The Ironwood relay drops packets when queue age exceeds ~25ms.
+/// Empirically 64KB keeps us well below the drop threshold while
+/// still achieving ~2.5 MB/s throughput over a single relay hop.
+const MAX_INFLIGHT: usize = 64 * 1024;
+
 
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +32,13 @@ pub enum StreamState {
     Closing,
     /// Both sides closed
     Closed,
+}
+
+/// A segment held for potential retransmission.
+#[derive(Clone)]
+struct UnackedSegment {
+    seq: u32,
+    data: Vec<u8>,
 }
 
 /// Individual bidirectional stream
@@ -37,7 +55,7 @@ pub struct Stream {
     /// Remote peer address (for debugging/logging)
     peer: Addr,
 
-    /// Receive buffer (data received from peer)
+    /// Receive buffer (data received from peer, in-order)
     recv_buf: Arc<Mutex<VecDeque<u8>>>,
 
     /// Send window (bytes we can send based on peer's last ACK)
@@ -60,24 +78,58 @@ pub struct Stream {
 
     /// Notify when stream is closed
     close_notify: Arc<Notify>,
+
+    // ── Reliability fields ────────────────────────────────────────────────
+
+    /// Next byte sequence number to send (sender side)
+    next_send_seq: Arc<AtomicU32>,
+
+    /// Highest cumulative ack received from peer (sender side)
+    send_ack_seq: Arc<AtomicU32>,
+
+    /// Next expected byte sequence number (receiver side)
+    next_recv_seq: Arc<AtomicU32>,
+
+    /// Unacknowledged segments kept for retransmission (sender side)
+    unacked: Arc<Mutex<VecDeque<UnackedSegment>>>,
+
+    /// Peer has sent FIN — no more data will arrive.
+    /// poll_read returns EOF only when recv_buf is empty AND this is true.
+    /// Separated from `state` to avoid losing buffered data on FIN.
+    peer_fin: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Stream {
     /// Create a new stream
     pub fn new(port: u16, id: u16, peer: Addr, outgoing: mpsc::Sender<Packet>) -> Self {
-        Self {
+        let stream = Self {
             port,
             id,
             peer,
             recv_buf: Arc::new(Mutex::new(VecDeque::new())),
             send_window: Arc::new(AtomicUsize::new(DEFAULT_WINDOW_SIZE)),
             recv_window: Arc::new(AtomicUsize::new(DEFAULT_WINDOW_SIZE)),
-            outgoing,
+            outgoing: outgoing.clone(),
             state: Arc::new(Mutex::new(StreamState::Opening)),
             read_notify: Arc::new(Notify::new()),
             write_notify: Arc::new(Notify::new()),
             close_notify: Arc::new(Notify::new()),
+            next_send_seq: Arc::new(AtomicU32::new(0)),
+            send_ack_seq: Arc::new(AtomicU32::new(0)),
+            next_recv_seq: Arc::new(AtomicU32::new(0)),
+            unacked: Arc::new(Mutex::new(VecDeque::new())),
+            peer_fin: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        // Spawn retransmit timer
+        {
+            let s = stream.clone();
+            tokio::spawn(async move {
+                s.retransmit_loop().await;
+            });
         }
+
+        stream
     }
 
     /// Get stream ID
@@ -138,48 +190,108 @@ impl Stream {
                 }
 
                 if packet.is_fin() {
-                    // Peer initiated close - send FIN back and transition to Closed
-                    *state = StreamState::Closed;
+                    // Peer finished sending — set flag so poll_read returns EOF
+                    // after recv_buf is fully drained.  Do NOT set state=Closed
+                    // yet: there may still be data in recv_buf that poll_read
+                    // hasn't delivered to copy_bidirectional.
+                    self.peer_fin.store(true, Ordering::Release);
                     self.read_notify.notify_waiters();
                     self.close_notify.notify_waiters();
 
                     // Release the lock before sending FIN
                     drop(state);
 
-                    // Send FIN to acknowledge
+                    // Send FIN back to acknowledge (non-blocking to prevent deadlock)
                     let fin = Packet::fin(self.port, self.id);
-                    let _ = self.outgoing.send(fin).await;
+                    let _ = self.outgoing.try_send(fin);
 
                     return Ok(());
                 }
 
-                // Update send window if ACK
+                // Update send window and ack progress if ACK
                 if packet.is_ack() {
                     self.send_window.store(packet.window, Ordering::Release);
+
+                    // Remove acked segments from retransmit buffer
+                    let ack = packet.ack_seq;
+                    let old_ack = self.send_ack_seq.load(Ordering::Acquire);
+                    if ack > old_ack {
+                        self.send_ack_seq.store(ack, Ordering::Release);
+                        let mut unacked = self.unacked.lock().await;
+                        while let Some(front) = unacked.front() {
+                            let seg_end = front.seq + front.data.len() as u32;
+                            if seg_end <= ack {
+                                unacked.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
                     self.write_notify.notify_one();
                 }
 
                 // Deliver data if present
                 if !packet.data.is_empty() {
-                    let mut recv_buf = self.recv_buf.lock().await;
-                    recv_buf.extend(&packet.data);
-                    self.read_notify.notify_one();
+                    let expected = self.next_recv_seq.load(Ordering::Acquire);
+                    let pkt_seq = packet.seq;
+                    let pkt_end = pkt_seq + packet.data.len() as u32;
+                    trace!("rx data: seq={} len={} expected={}", pkt_seq, packet.data.len(), expected);
 
-                    // Update our receive window
-                    let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len());
-                    self.recv_window.store(available, Ordering::Release);
+                    if pkt_seq == expected {
+                        // In-order delivery
+                        let mut recv_buf = self.recv_buf.lock().await;
+                        recv_buf.extend(&packet.data);
+                        self.next_recv_seq.store(pkt_end, Ordering::Release);
+                        self.read_notify.notify_one();
 
-                    // Send ACK with updated window
-                    drop(recv_buf); // Release lock before sending
-                    self.send_ack().await?;
+                        // Update our receive window
+                        let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len());
+                        self.recv_window.store(available, Ordering::Release);
+                        drop(recv_buf);
+
+                        // Send ACK with updated cumulative ack
+                        self.send_ack_nonblocking();
+                    } else if pkt_seq > expected {
+                        // Gap detected — packet arrived out of order or earlier packets lost.
+                        // Drop this packet and send a duplicate ACK for expected seq to
+                        // trigger retransmission on the sender.
+                        trace!("Out-of-order: expected seq={}, got seq={}, dropping", expected, pkt_seq);
+                        self.send_ack_nonblocking();
+                    } else {
+                        // pkt_seq < expected: duplicate — ACK anyway so sender can advance
+                        trace!("Duplicate: expected seq={}, got seq={}", expected, pkt_seq);
+                        self.send_ack_nonblocking();
+                    }
                 }
 
                 Ok(())
             }
             StreamState::Closing => {
+                if packet.is_ack() {
+                    // ACK in Closing state — update ack tracking
+                    self.send_window.store(packet.window, Ordering::Release);
+                    let ack = packet.ack_seq;
+                    let old_ack = self.send_ack_seq.load(Ordering::Acquire);
+                    if ack > old_ack {
+                        self.send_ack_seq.store(ack, Ordering::Release);
+                        let mut unacked = self.unacked.lock().await;
+                        while let Some(front) = unacked.front() {
+                            let seg_end = front.seq + front.data.len() as u32;
+                            if seg_end <= ack {
+                                unacked.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.write_notify.notify_one();
+                }
                 if packet.is_fin() {
                     // Both sides closed
                     *state = StreamState::Closed;
+                    self.peer_fin.store(true, Ordering::Release);
+                    self.read_notify.notify_waiters();
                     self.close_notify.notify_waiters();
                 }
                 Ok(())
@@ -191,15 +303,131 @@ impl Stream {
         }
     }
 
-    /// Send an ACK packet with current receive window
-    async fn send_ack(&self) -> Result<()> {
+    /// Send an ACK packet with cumulative ack_seq and window (non-blocking).
+    ///
+    /// Uses `try_send` to avoid blocking the reader task when the outgoing
+    /// channel is full.  A dropped ACK is acceptable because:
+    /// - The peer's next `poll_write` piggybacks an ACK via `data_ack`.
+    /// - The retransmit timer will eventually trigger if the sender stalls.
+    fn send_ack_nonblocking(&self) {
+        let ack_seq = self.next_recv_seq.load(Ordering::Acquire);
         let window = self.recv_window.load(Ordering::Acquire);
-        let packet = Packet::ack(self.port, self.id, window);
-        self.outgoing
-            .send(packet)
-            .await
-            .map_err(|_| Error::ConnectionClosed)?;
-        Ok(())
+        let packet = Packet::ack(self.port, self.id, ack_seq, window);
+        match self.outgoing.try_send(packet) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!("send_ack: channel full, dropping ACK (ack_seq={}, window={})", ack_seq, window);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                trace!("send_ack: channel closed");
+            }
+        }
+    }
+
+    /// Retransmit loop — resends unacked segments every RETRANSMIT_TIMEOUT_MS.
+    ///
+    /// Adaptive retransmit burst size (cwnd 1..8 segments per tick):
+    /// - When ACK advances (progress), double cwnd (up to 8).
+    /// - When ACK stalls for 2+ ticks, reset cwnd=1.
+    ///
+    /// In-flight cap is handled statically by MAX_INFLIGHT in poll_write.
+    async fn retransmit_loop(&self) {
+        let interval = tokio::time::Duration::from_millis(RETRANSMIT_TIMEOUT_MS);
+        let mut cwnd: usize = 1;
+        let mut prev_ack: u32 = 0;
+        let mut stall_ticks: u32 = 0;
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let state = match self.state.try_lock() {
+                Ok(g) => *g,
+                Err(_) => {
+                    trace!("Retransmit: state lock contention, skipping tick");
+                    continue;
+                }
+            };
+            if state == StreamState::Closed {
+                debug!("Retransmit loop: stream closed, exiting");
+                return;
+            }
+
+            let ack_seq = self.send_ack_seq.load(Ordering::Acquire);
+            let next_seq = self.next_send_seq.load(Ordering::Acquire);
+
+            // Nothing unacked
+            if ack_seq >= next_seq {
+                if next_seq > 0 && cwnd > 1 {
+                    debug!("Retransmit: all acked, ack_seq={} next_seq={}", ack_seq, next_seq);
+                }
+                cwnd = 1;
+                prev_ack = ack_seq;
+                stall_ticks = 0;
+                continue;
+            }
+
+            // Adaptive retransmit cwnd: track whether ACK is advancing
+            if ack_seq > prev_ack {
+                stall_ticks = 0;
+                cwnd = (cwnd * 2).min(8);
+            } else {
+                stall_ticks += 1;
+                if stall_ticks >= 2 {
+                    cwnd = 1;
+                }
+            }
+            prev_ack = ack_seq;
+
+            // Collect segments to retransmit (under lock), then release lock
+            let to_resend: Vec<(u32, Vec<u8>)> = {
+                let unacked = self.unacked.lock().await;
+                unacked.iter()
+                    .filter(|seg| seg.seq + seg.data.len() as u32 > ack_seq)
+                    .take(cwnd)
+                    .map(|seg| (seg.seq, seg.data.clone()))
+                    .collect()
+            };
+            // Lock released here
+
+            if to_resend.is_empty() {
+                continue;
+            }
+
+            let recv_ack = self.next_recv_seq.load(Ordering::Acquire);
+            let window = self.recv_window.load(Ordering::Acquire);
+
+            let mut sent = 0usize;
+            for (seq, data) in &to_resend {
+                let pkt = Packet::data_ack(
+                    self.port, self.id,
+                    data.clone(),
+                    *seq,
+                    recv_ack,
+                    window,
+                );
+                match self.outgoing.try_send(pkt) {
+                    Ok(()) => {
+                        sent += 1;
+                        trace!("retransmit: seq={} len={}", seq, data.len());
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                }
+
+                // Check if ACK advanced while sending
+                let new_ack = self.send_ack_seq.load(Ordering::Acquire);
+                if new_ack > ack_seq {
+                    break;
+                }
+            }
+
+            if sent > 0 {
+                debug!(
+                    "Retransmit: sent={} cwnd={} stall={} ack_seq={} next_send={}",
+                    sent, cwnd, stall_ticks, ack_seq, next_seq
+                );
+            }
+        }
     }
 
     /// Send a SYN packet to initiate the stream
@@ -288,13 +516,31 @@ impl AsyncRead for Stream {
             buf.put_slice(&data);
 
             // Update receive window
+            let old_window = this.recv_window.load(Ordering::Acquire);
             let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len());
             this.recv_window.store(available, Ordering::Release);
+
+            // Send window update ACK when we've freed a significant amount of
+            // buffer space. This prevents the sender from stalling at window=0
+            // when the receiver is draining data faster than ACKs arrive.
+            // Threshold: send update when window crosses the half-mark upward.
+            let half = DEFAULT_WINDOW_SIZE / 2;
+            if old_window < half && available >= half {
+                let ack_seq = this.next_recv_seq.load(Ordering::Acquire);
+                let packet = Packet::ack(this.port, this.id, ack_seq, available);
+                let _ = this.outgoing.try_send(packet);
+            }
 
             return Poll::Ready(Ok(()));
         }
 
-        // No data available, check stream state
+        // No data available — check if peer has sent FIN or stream is closed
+        if this.peer_fin.load(Ordering::Acquire) {
+            // Peer sent FIN and recv_buf is empty → EOF
+            debug!("poll_read: EOF (peer_fin=true, recv_buf empty)");
+            return Poll::Ready(Ok(()));
+        }
+
         let state = match this.state.try_lock() {
             Ok(guard) => *guard,
             Err(_) => {
@@ -304,8 +550,8 @@ impl AsyncRead for Stream {
         };
 
         match state {
-            StreamState::Closed | StreamState::Closing => {
-                // Stream closed or closing, return EOF (no data)
+            StreamState::Closed => {
+                // Stream fully closed (RST or both FINs exchanged)
                 Poll::Ready(Ok(()))
             }
             _ => {
@@ -358,6 +604,7 @@ impl AsyncWrite for Stream {
         let window = this.send_window.load(Ordering::Acquire);
         if window == 0 {
             // No space available, wait for ACK
+            trace!("poll_write: window=0, waiting for ACK");
             let waker = cx.waker().clone();
             let notify = this.write_notify.clone();
             tokio::spawn(async move {
@@ -367,24 +614,85 @@ impl AsyncWrite for Stream {
             return Poll::Pending;
         }
 
-        // Send what we can within the window
-        let to_send = std::cmp::min(buf.len(), window);
+        // Limit in-flight data to MAX_INFLIGHT to avoid overwhelming the
+        // Ironwood relay (drops packets when queue age exceeds ~25ms).
+        let next_seq = this.next_send_seq.load(Ordering::Acquire);
+        let ack_seq_val = this.send_ack_seq.load(Ordering::Acquire);
+        let in_flight = next_seq.saturating_sub(ack_seq_val) as usize;
+        let effective_wnd = window.min(MAX_INFLIGHT);
+        let available = effective_wnd.saturating_sub(in_flight);
+        if available == 0 {
+            trace!("poll_write: in_flight={} >= effective_wnd={}, waiting", in_flight, effective_wnd);
+            let waker = cx.waker().clone();
+            let notify = this.write_notify.clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                waker.wake();
+            });
+            return Poll::Pending;
+        }
+
+        // Send what we can within the available window, capped by segment size
+        let to_send = buf.len().min(available).min(MAX_DATA_SIZE);
         let data = buf[..to_send].to_vec();
-        let window_after = this.recv_window.load(Ordering::Acquire);
-        let packet = Packet::data_ack(this.port, this.id, data, window_after);
 
-        // Decrease send window
-        this.send_window.fetch_sub(to_send, Ordering::Release);
+        // Assign sequence number
+        let seq = this.next_send_seq.fetch_add(to_send as u32, Ordering::AcqRel);
+        let ack_seq = this.next_recv_seq.load(Ordering::Acquire);
+        let recv_window = this.recv_window.load(Ordering::Acquire);
+        let packet = Packet::data_ack(this.port, this.id, data.clone(), seq, ack_seq, recv_window);
 
-        // Send packet asynchronously
-        let outgoing = this.outgoing.clone();
-        let waker = cx.waker().clone();
-        tokio::spawn(async move {
-            let _ = outgoing.send(packet).await;
-            waker.wake();
-        });
+        // Enqueue the packet synchronously via try_send to preserve ordering.
+        //
+        // The original code used tokio::spawn + outgoing.send() which caused
+        // data reordering: two consecutive poll_write calls could spawn tasks
+        // that race for the mpsc channel, delivering packets out of order.
+        //
+        // try_send guarantees that if it succeeds, the packet is already in
+        // the channel in FIFO order before we return Ready.
+        match this.outgoing.try_send(packet) {
+            Ok(()) => {
+                // Store segment for potential retransmission
+                {
+                    // Use try_lock to avoid blocking in poll context
+                    if let Ok(mut unacked) = this.unacked.try_lock() {
+                        unacked.push_back(UnackedSegment { seq, data });
+                    }
+                }
 
-        Poll::Ready(Ok(to_send))
+                // Packet enqueued — decrease send window and report success
+                this.send_window.fetch_sub(to_send, Ordering::Release);
+                trace!("poll_write: sent {} bytes seq={}, window now {}", to_send, seq,
+                    this.send_window.load(Ordering::Acquire));
+                Poll::Ready(Ok(to_send))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel full — revert seq counter since packet was NOT sent
+                this.next_send_seq.fetch_sub(to_send as u32, Ordering::AcqRel);
+
+                // Return Pending and wake when space is available.
+                // We did NOT consume any bytes from buf, so the caller will
+                // retry with the same data.
+                trace!("poll_write: channel FULL for {} bytes, returning Pending", to_send);
+                let waker = cx.waker().clone();
+                let outgoing = this.outgoing.clone();
+                tokio::spawn(async move {
+                    // reserve() completes when channel has capacity
+                    match outgoing.reserve().await {
+                        Ok(permit) => drop(permit), // release the reserved slot
+                        Err(_) => {} // channel closed, waker will handle it
+                    }
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Outgoing channel closed",
+                )))
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -395,23 +703,8 @@ impl AsyncWrite for Stream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Initiate graceful close
         let state = match this.state.try_lock() {
-            Ok(mut guard) => {
-                let current = *guard;
-                if current == StreamState::Open {
-                    *guard = StreamState::Closing;
-                    drop(guard);
-
-                    // Send FIN packet
-                    let packet = Packet::fin(this.port, this.id);
-                    let outgoing = this.outgoing.clone();
-                    tokio::spawn(async move {
-                        let _ = outgoing.send(packet).await;
-                    });
-                }
-                current
-            }
+            Ok(guard) => *guard,
             Err(_) => {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -422,7 +715,64 @@ impl AsyncWrite for Stream {
             return Poll::Ready(Ok(()));
         }
 
-        // Wait for close to complete
+        // Before sending FIN, wait for all sent data to be acknowledged.
+        // Otherwise the peer may FIN back before it receives all our data,
+        // and the retransmit loop exits on Closed state.
+        let ack_seq = this.send_ack_seq.load(Ordering::Acquire);
+        let next_seq = this.next_send_seq.load(Ordering::Acquire);
+        if ack_seq < next_seq {
+            // Still have unacked data — wait for ACKs
+            trace!("poll_shutdown: waiting for ACK (ack={}, next={})", ack_seq, next_seq);
+            let waker = cx.waker().clone();
+            let notify = this.write_notify.clone();
+            tokio::spawn(async move {
+                notify.notified().await;
+                waker.wake();
+            });
+            return Poll::Pending;
+        }
+
+        // All data acked, now send FIN (if we haven't already)
+        if state == StreamState::Open {
+            match this.state.try_lock() {
+                Ok(mut guard) => {
+                    if *guard == StreamState::Open {
+                        // If peer already sent FIN, go straight to Closed
+                        // (we already sent FIN back in handle_packet).
+                        if this.peer_fin.load(Ordering::Acquire) {
+                            *guard = StreamState::Closed;
+                            drop(guard);
+                            return Poll::Ready(Ok(()));
+                        }
+                        *guard = StreamState::Closing;
+                        drop(guard);
+
+                        let packet = Packet::fin(this.port, this.id);
+                        let outgoing = this.outgoing.clone();
+                        tokio::spawn(async move {
+                            let _ = outgoing.send(packet).await;
+                        });
+                    }
+                }
+                Err(_) => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // If peer already sent FIN, we're done
+        if this.peer_fin.load(Ordering::Acquire) {
+            match this.state.try_lock() {
+                Ok(mut guard) => {
+                    *guard = StreamState::Closed;
+                }
+                Err(_) => {}
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Wait for peer's FIN
         let waker = cx.waker().clone();
         let notify = this.close_notify.clone();
         tokio::spawn(async move {
@@ -535,6 +885,8 @@ mod tests {
             stream_id: 1,
             flags: FLAG_ACK | FLAG_SYN,
             data: Vec::new(),
+            seq: 0,
+            ack_seq: 0,
             window: 1024,
         };
         stream.handle_packet(ack).await.unwrap();

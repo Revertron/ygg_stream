@@ -81,6 +81,20 @@ impl AsyncConn {
         self.port
     }
 
+    /// Get a clone of the underlying [`Stream`].
+    ///
+    /// `Stream` is `Clone` and all internals are `Arc`-wrapped, so this is
+    /// cheap.  The returned value implements `AsyncRead + AsyncWrite` and can
+    /// be used directly with [`tokio::io::copy_bidirectional`].
+    pub fn stream(&self) -> Stream {
+        self.stream.clone()
+    }
+
+    /// Consume this `AsyncConn` and return the underlying [`Stream`].
+    pub fn into_stream(self) -> Stream {
+        self.stream
+    }
+
     /// Returns `true` while the stream is open.
     pub async fn is_alive(&self) -> bool {
         matches!(

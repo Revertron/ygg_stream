@@ -539,7 +539,7 @@ async fn writer_task(
                     Some(pkt) => {
                         let data = pkt.encode()?;
                         pkt_count += 1;
-                        if pkt_count <= 5 || pkt.is_syn() {
+                        if pkt_count <= 5 || pkt.is_syn() || pkt_count % 100 == 0 {
                             info!("Writer sending pkt #{} ({} bytes, flags=0x{:02x}, port={}, stream={}) to {}",
                                 pkt_count, data.len(), pkt.flags, pkt.port, pkt.stream_id, peer_hex);
                         }
@@ -547,6 +547,11 @@ async fn writer_task(
                             error!("write_to failed for peer {}: {}", peer_hex, e);
                             return Err(e.into());
                         }
+                        // Yield after each write so ironwood's internal queues can
+                        // drain before the next packet is submitted.  Without this,
+                        // rapid-fire writes overflow ironwood's delivery queue and
+                        // packets older than 25ms are silently dropped.
+                        tokio::task::yield_now().await;
                     }
                     None => {
                         info!("Outgoing channel closed for peer {} (sent {} pkts)", peer_hex, pkt_count);
