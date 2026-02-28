@@ -78,7 +78,7 @@ fn print_usage() {
     eprintln!("  tcp_proxy reverse --peer <uri> --listen-port <port> --target <addr:port> [--key <hex>]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --peer          Yggdrasil peer URI (e.g. tcp://1.2.3.4:1234)");
+    eprintln!("  --peer          Yggdrasil peer URI (can be specified multiple times for redundancy)");
     eprintln!("  --bind          Local TCP address to bind (forward mode)");
     eprintln!("  --remote-key    Remote peer's ed25519 public key (64 hex chars)");
     eprintln!("  --remote-port   Remote ygg_stream port");
@@ -112,10 +112,7 @@ fn print_usage() {
 ///
 /// --peer is optional; if omitted, the node starts with no peers.
 async fn create_node(args: &[String]) -> Result<Arc<AsyncNode>, Box<dyn std::error::Error>> {
-    let peers: Vec<String> = match get_arg(args, "--peer") {
-        Ok(uri) if !uri.is_empty() => vec![uri],
-        _ => vec![],
-    };
+    let peers = get_all_args(args, "--peer");
 
     let node = if let Ok(key_hex) = get_arg(args, "--key") {
         let key_bytes = hex::decode(&key_hex)?;
@@ -193,4 +190,11 @@ fn get_arg(args: &[String], name: &str) -> Result<String, String> {
     args.get(pos + 1)
         .cloned()
         .ok_or_else(|| format!("missing value for {}", name))
+}
+
+fn get_all_args(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == name)
+        .map(|w| w[1].clone())
+        .collect()
 }
