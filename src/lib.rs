@@ -60,6 +60,7 @@ pub mod manager;
 pub mod node;
 pub mod protocol;
 pub mod stream;
+pub mod tcp_proxy;
 
 // Re-export main types
 pub use async_node::{AsyncConn, AsyncNode};
@@ -69,3 +70,4 @@ pub use manager::{ConnectHandle, DatagramListener, Listener, StreamManager};
 pub use node::{Conn, Node};
 pub use protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_PACKET_SIZE};
 pub use stream::{Stream, StreamState};
+pub use tcp_proxy::{TcpToYgg, YggToTcp};

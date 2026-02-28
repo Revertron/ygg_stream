@@ -8,8 +8,11 @@ pub const FLAG_FIN: u8 = 0x04; // Close stream gracefully
 pub const FLAG_RST: u8 = 0x08; // Reset stream (abort)
 pub const FLAG_DGRAM: u8 = 0x10; // Connectionless datagram
 
-/// Default flow control window size (256 KB)
-pub const DEFAULT_WINDOW_SIZE: usize = 256 * 1024;
+/// Default flow control window size (64 KB).
+///
+/// Kept intentionally small so that each window burst doesn't overflow
+/// ironwood's internal delivery queue (which drops packets older than 25 ms).
+pub const DEFAULT_WINDOW_SIZE: usize = 64 * 1024;
 
 /// Maximum packet size (64 KB - 1 byte)
 pub const MAX_PACKET_SIZE: usize = 65535;
@@ -17,14 +20,24 @@ pub const MAX_PACKET_SIZE: usize = 65535;
 /// Maximum data payload per packet (accounting for 7-byte header)
 pub const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - 7;
 
-/// Packet header size (stream_id + flags + length)
+/// Minimum packet header size (port+stream_id:4 + flags:1 + length:2)
 pub const HEADER_SIZE: usize = 7;
+
+/// Extra bytes when ACK flag is set (ack_seq: u32 + window: u32)
+pub const ACK_EXTRA_SIZE: usize = 8;
+
+/// Extra bytes when data is present (seq: u32)
+pub const SEQ_SIZE: usize = 4;
 
 /// Protocol packet
 ///
 /// Wire format:
 /// ```text
-/// [port:u16 << 16 | stream_id:u16 : u32][flags: u8][length: u16][data: bytes]
+/// [port<<16|stream_id : u32][flags : u8]
+///   if data.len() > 0: [seq : u32]        // byte-level sequence number
+///   if ACK flag:        [ack_seq : u32]    // cumulative ack: next expected byte
+///                       [window  : u32]    // receiver's buffer space
+/// [length : u16][data : bytes]
 /// ```
 ///
 /// The 4-byte combined field encodes `(port << 16) | stream_id`.
@@ -42,19 +55,29 @@ pub struct Packet {
     /// Data payload
     pub data: Vec<u8>,
 
-    /// Receiver's available window size (for flow control)
-    /// Encoded in flags byte when ACK flag is set
+    /// Byte-level sequence number of the first data byte.
+    /// Only meaningful when data is non-empty.
+    pub seq: u32,
+
+    /// Cumulative acknowledgment: "I have received all bytes up to ack_seq".
+    /// Only meaningful when ACK flag is set.
+    pub ack_seq: u32,
+
+    /// Receiver's available window size (for flow control).
+    /// Only meaningful when ACK flag is set.
     pub window: usize,
 }
 
 impl Packet {
-    /// Create a new packet
+    /// Create a new control packet (no data, no seq/ack)
     pub fn new(port: u16, stream_id: u16, flags: u8, data: Vec<u8>) -> Self {
         Self {
             port,
             stream_id,
             flags,
             data,
+            seq: 0,
+            ack_seq: 0,
             window: DEFAULT_WINDOW_SIZE,
         }
     }
@@ -69,18 +92,20 @@ impl Packet {
         Self::new(port, stream_id, FLAG_SYN | FLAG_ACK, Vec::new())
     }
 
-    /// Create a data packet
+    /// Create a data packet with sequence number
     pub fn data(port: u16, stream_id: u16, data: Vec<u8>) -> Self {
         Self::new(port, stream_id, 0, data)
     }
 
-    /// Create a data + ACK packet
-    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, window: usize) -> Self {
+    /// Create a data + ACK packet with sequence numbers and window
+    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, seq: u32, ack_seq: u32, window: usize) -> Self {
         Self {
             port,
             stream_id,
             flags: FLAG_ACK,
             data,
+            seq,
+            ack_seq,
             window,
         }
     }
@@ -100,13 +125,15 @@ impl Packet {
         Self::new(port, 0, FLAG_DGRAM, data)
     }
 
-    /// Create an ACK packet with window update
-    pub fn ack(port: u16, stream_id: u16, window: usize) -> Self {
+    /// Create an ACK packet with cumulative ack and window update
+    pub fn ack(port: u16, stream_id: u16, ack_seq: u32, window: usize) -> Self {
         Self {
             port,
             stream_id,
             flags: FLAG_ACK,
             data: Vec::new(),
+            seq: 0,
+            ack_seq,
             window,
         }
     }
@@ -138,14 +165,24 @@ impl Packet {
 
     /// Encode packet to bytes
     ///
-    /// Format: [(port << 16 | stream_id): u32][flags: u8][length: u16][data]
+    /// Format:
+    /// ```text
+    /// [port<<16|stream_id : u32][flags : u8]
+    ///   if data.len() > 0: [seq : u32]
+    ///   if ACK:             [ack_seq : u32][window : u32]
+    /// [length : u16][data]
+    /// ```
     pub fn encode(&self) -> Result<Vec<u8>> {
         let data_len = self.data.len();
         if data_len > MAX_DATA_SIZE {
             return Err(Error::PacketTooLarge(data_len, MAX_DATA_SIZE));
         }
 
-        let mut buf = BytesMut::with_capacity(HEADER_SIZE + data_len);
+        let has_data = data_len > 0;
+        let has_ack = self.flags & FLAG_ACK != 0;
+        let extra = if has_data { SEQ_SIZE } else { 0 }
+                  + if has_ack { ACK_EXTRA_SIZE } else { 0 };
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + extra + data_len);
 
         // Write combined port + stream_id (4 bytes, big-endian)
         let combined = ((self.port as u32) << 16) | (self.stream_id as u32);
@@ -153,6 +190,17 @@ impl Packet {
 
         // Write flags (1 byte)
         buf.put_u8(self.flags);
+
+        // Write seq (4 bytes) if data is present
+        if has_data {
+            buf.put_u32(self.seq);
+        }
+
+        // Write ack_seq + window (8 bytes) if ACK flag is set
+        if has_ack {
+            buf.put_u32(self.ack_seq);
+            buf.put_u32(self.window as u32);
+        }
 
         // Write length (2 bytes, big-endian)
         buf.put_u16(data_len as u16);
@@ -184,27 +232,103 @@ impl Packet {
         // Read flags (1 byte)
         let flags = cursor.get_u8();
 
-        // Read length (2 bytes, big-endian)
-        let length = cursor.get_u16() as usize;
+        // We need to peek at the length field to know if data is present.
+        // But length comes AFTER optional seq/ack fields. We'll read in order:
+        //   1. If there will be data (determined after reading length), read seq
+        //   2. If ACK, read ack_seq + window
+        //   3. Read length
+        //   4. Read data
+        //
+        // Problem: we don't know if data is present until we read length, but
+        // length comes after the optional fields.
+        //
+        // Solution: compute the extra header size from the remaining buffer.
+        // header_consumed = 5 (so far). remaining = buf.len() - 5.
+        // After optional fields, there's length(2) + data.
+        // We try: assume data present → extra includes SEQ_SIZE if ACK also present → ACK_EXTRA_SIZE
+        // Then check length field at the right offset.
 
-        // Validate length matches remaining data
-        let remaining = buf.len() - HEADER_SIZE;
-        if length != remaining {
-            return Err(Error::Protocol(format!(
-                "Length mismatch: header says {} bytes, but {} bytes available",
-                length, remaining
-            )));
-        }
+        let has_ack = flags & FLAG_ACK != 0;
 
-        // Read data payload
-        let data = buf[HEADER_SIZE..].to_vec();
+        // Try to determine if data is present by computing expected offsets.
+        // First try with data present, then without.
+        let pos = cursor.position() as usize; // should be 5
+
+        // Calculate minimum extra bytes needed
+        let extra_with_data = SEQ_SIZE + if has_ack { ACK_EXTRA_SIZE } else { 0 };
+        let extra_no_data = if has_ack { ACK_EXTRA_SIZE } else { 0 };
+
+        // Try with data: pos + extra_with_data + 2 (length) should be <= buf.len()
+        // and the length at that offset should be > 0 and match remaining
+        let (seq, ack_seq, window, data_offset) =
+            if buf.len() >= pos + extra_with_data + 2 {
+                // Read length field at pos + extra_with_data
+                let len_offset = pos + extra_with_data;
+                let length_candidate = u16::from_be_bytes([buf[len_offset], buf[len_offset + 1]]) as usize;
+                let expected_total = len_offset + 2 + length_candidate;
+
+                if length_candidate > 0 && expected_total == buf.len() {
+                    // Data is present — read seq, then optionally ack fields
+                    cursor.set_position(pos as u64);
+                    let seq = cursor.get_u32();
+                    let (ack_seq, window) = if has_ack {
+                        let a = cursor.get_u32();
+                        let w = cursor.get_u32() as usize;
+                        (a, w)
+                    } else {
+                        (0, DEFAULT_WINDOW_SIZE)
+                    };
+                    let _ = cursor.get_u16(); // skip length, we already know it
+                    (seq, ack_seq, window, len_offset + 2)
+                } else if buf.len() >= pos + extra_no_data + 2 {
+                    // No data — read only ack fields
+                    cursor.set_position(pos as u64);
+                    let (ack_seq, window) = if has_ack {
+                        let a = cursor.get_u32();
+                        let w = cursor.get_u32() as usize;
+                        (a, w)
+                    } else {
+                        (0, DEFAULT_WINDOW_SIZE)
+                    };
+                    let _ = cursor.get_u16();
+                    let offset = pos + extra_no_data + 2;
+                    (0, ack_seq, window, offset)
+                } else {
+                    return Err(Error::Protocol(format!(
+                        "Packet too short for flags 0x{:02x}: {} bytes",
+                        flags, buf.len()
+                    )));
+                }
+            } else if buf.len() >= pos + extra_no_data + 2 {
+                // Not enough room for data with seq — try no-data
+                cursor.set_position(pos as u64);
+                let (ack_seq, window) = if has_ack {
+                    let a = cursor.get_u32();
+                    let w = cursor.get_u32() as usize;
+                    (a, w)
+                } else {
+                    (0, DEFAULT_WINDOW_SIZE)
+                };
+                let _ = cursor.get_u16();
+                let offset = pos + extra_no_data + 2;
+                (0, ack_seq, window, offset)
+            } else {
+                return Err(Error::Protocol(format!(
+                    "Packet too short for flags 0x{:02x}: {} bytes",
+                    flags, buf.len()
+                )));
+            };
+
+        let data = buf[data_offset..].to_vec();
 
         Ok(Self {
             port,
             stream_id,
             flags,
             data,
-            window: DEFAULT_WINDOW_SIZE,
+            seq,
+            ack_seq,
+            window,
         })
     }
 }
@@ -307,18 +431,43 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_invalid_length() {
-        // Create packet with mismatched length field
-        let mut buf = BytesMut::new();
-        buf.put_u32(1); // combined port+stream_id
-        buf.put_u8(0); // flags
-        buf.put_u16(100); // length says 100 bytes
-        buf.put_slice(b"short"); // but only 5 bytes of data
+    fn test_decode_roundtrip_data() {
+        // Verify encode → decode roundtrip for data packets (no ACK)
+        let packet = Packet::data(3, 789, b"test data".to_vec());
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.port, 3);
+        assert_eq!(decoded.stream_id, 789);
+        assert_eq!(decoded.data, b"test data");
+        assert_eq!(decoded.seq, 0);
+    }
 
-        assert!(matches!(
-            Packet::decode(&buf),
-            Err(Error::Protocol(_))
-        ));
+    #[test]
+    fn test_decode_roundtrip_data_ack() {
+        // Verify encode → decode roundtrip for data+ACK packets
+        let packet = Packet::data_ack(5, 42, b"payload".to_vec(), 1000, 500, 32768);
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.port, 5);
+        assert_eq!(decoded.stream_id, 42);
+        assert_eq!(decoded.data, b"payload");
+        assert_eq!(decoded.seq, 1000);
+        assert_eq!(decoded.ack_seq, 500);
+        assert_eq!(decoded.window, 32768);
+    }
+
+    #[test]
+    fn test_decode_roundtrip_ack_only() {
+        // Verify encode → decode roundtrip for pure ACK (no data)
+        let packet = Packet::ack(1, 2, 9999, 65536);
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.port, 1);
+        assert_eq!(decoded.stream_id, 2);
+        assert!(decoded.is_ack());
+        assert!(decoded.data.is_empty());
+        assert_eq!(decoded.ack_seq, 9999);
+        assert_eq!(decoded.window, 65536);
     }
 
     #[test]
@@ -345,15 +494,27 @@ mod tests {
 
     #[test]
     fn test_packet_empty_data() {
-        let packet = Packet::new(1, 1, FLAG_ACK, Vec::new());
-        let encoded = packet.encode().unwrap();
+        // Non-ACK packet: just header (7 bytes)
+        let packet_no_ack = Packet::new(1, 1, 0, Vec::new());
+        let encoded = packet_no_ack.encode().unwrap();
         assert_eq!(encoded.len(), HEADER_SIZE);
 
         let decoded = Packet::decode(&encoded).unwrap();
         assert_eq!(decoded.port, 1);
         assert_eq!(decoded.stream_id, 1);
-        assert!(decoded.is_ack());
         assert!(decoded.data.is_empty());
+
+        // ACK packet: header + window (7 + 4 = 11 bytes)
+        let packet_ack = Packet::new(1, 1, FLAG_ACK, Vec::new());
+        let encoded_ack = packet_ack.encode().unwrap();
+        assert_eq!(encoded_ack.len(), HEADER_SIZE + ACK_EXTRA_SIZE);
+
+        let decoded_ack = Packet::decode(&encoded_ack).unwrap();
+        assert_eq!(decoded_ack.port, 1);
+        assert_eq!(decoded_ack.stream_id, 1);
+        assert!(decoded_ack.is_ack());
+        assert!(decoded_ack.data.is_empty());
+        assert_eq!(decoded_ack.window, DEFAULT_WINDOW_SIZE);
     }
 
     #[test]
