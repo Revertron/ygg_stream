@@ -328,10 +328,8 @@ impl Stream {
     /// - Start with cwnd=1 segment per tick.
     /// - When ACK advances (progress), double cwnd (up to 8).
     /// - When ACK stalls for 2+ ticks, reset cwnd=1.
-    /// - Space retransmits with 15ms delay between packets.
     async fn retransmit_loop(&self) {
         let interval = tokio::time::Duration::from_millis(RETRANSMIT_TIMEOUT_MS);
-        let inter_packet_delay = tokio::time::Duration::from_millis(15);
         let mut cwnd: usize = 1;
         let mut prev_ack: u32 = 0;
         let mut stall_ticks: u32 = 0;
@@ -413,14 +411,10 @@ impl Stream {
                     Err(mpsc::error::TrySendError::Closed(_)) => return,
                 }
 
-                // Space out retransmits
-                if sent < to_resend.len() {
-                    tokio::time::sleep(inter_packet_delay).await;
-                    // Check if ACK advanced while we waited
-                    let new_ack = self.send_ack_seq.load(Ordering::Acquire);
-                    if new_ack > ack_seq {
-                        break;
-                    }
+                // Check if ACK advanced while sending
+                let new_ack = self.send_ack_seq.load(Ordering::Acquire);
+                if new_ack > ack_seq {
+                    break;
                 }
             }
 
