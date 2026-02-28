@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::protocol::{Packet, DEFAULT_WINDOW_SIZE};
+use crate::protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_DATA_SIZE};
 use ironwood::Addr;
 use std::collections::VecDeque;
 use std::io;
@@ -13,14 +13,6 @@ use tracing::{debug, trace};
 
 /// Retransmit timeout in milliseconds.
 const RETRANSMIT_TIMEOUT_MS: u64 = 150;
-
-/// Maximum data payload per segment (bytes).
-///
-/// Ironwood's delivery queue drops the LARGEST packet when the oldest
-/// exceeds 25ms.  Keeping segments small (~1.4 KB) makes them less likely
-/// to be the "largest" victim.  Also reduces retransmission waste: a
-/// dropped 1.4 KB segment costs less than a dropped 8 KB segment.
-const MAX_SEGMENT_DATA: usize = 1400;
 
 
 /// Stream state
@@ -643,7 +635,7 @@ impl AsyncWrite for Stream {
         }
 
         // Send what we can within the available window, capped by segment size
-        let to_send = buf.len().min(available).min(MAX_SEGMENT_DATA);
+        let to_send = buf.len().min(available).min(MAX_DATA_SIZE);
         let data = buf[..to_send].to_vec();
 
         // Assign sequence number

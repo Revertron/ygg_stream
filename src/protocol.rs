@@ -8,13 +8,8 @@ pub const FLAG_FIN: u8 = 0x04; // Close stream gracefully
 pub const FLAG_RST: u8 = 0x08; // Reset stream (abort)
 pub const FLAG_DGRAM: u8 = 0x10; // Connectionless datagram
 
-/// Default flow control window size (16 KB).
-///
-/// Ironwood's internal delivery queue drops the LARGEST packet when the
-/// oldest exceeds 25 ms.  With 1400-byte segments (not "largest" for
-/// ironwood drop) and fast retransmit, a larger window is viable.
-/// ~46 segments of 1400 bytes.
-pub const DEFAULT_WINDOW_SIZE: usize = 64 * 1024;
+/// Default flow control window size (256 KB)
+pub const DEFAULT_WINDOW_SIZE: usize = 256 * 1024;
 
 /// Maximum packet size (64 KB - 1 byte)
 pub const MAX_PACKET_SIZE: usize = 65535;
