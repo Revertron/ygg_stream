@@ -14,19 +14,11 @@ use tracing::{debug, trace};
 /// Retransmit timeout in milliseconds.
 const RETRANSMIT_TIMEOUT_MS: u64 = 150;
 
-/// Initial congestion window (bytes) — start conservatively.
-const INITIAL_CONG_WND: usize = 16 * 1024;
-
-/// Minimum congestion window (bytes) — never go below this.
-const MIN_CONG_WND: usize = 2 * 1024;
-
-/// Initial slow-start threshold (bytes).
-const INITIAL_SSTHRESH: usize = 128 * 1024;
-
-/// Maximum congestion window (bytes).
-/// The Ironwood relay drops packets when queue age > 25ms.
-/// Empirically ~64KB in-flight is sustainable; above that stalls occur.
-const MAX_CONG_WND: usize = 64 * 1024;
+/// Maximum bytes allowed in-flight (sent but not yet ACKed).
+/// The Ironwood relay drops packets when queue age exceeds ~25ms.
+/// Empirically 64KB keeps us well below the drop threshold while
+/// still achieving ~2.5 MB/s throughput over a single relay hop.
+const MAX_INFLIGHT: usize = 64 * 1024;
 
 
 /// Stream state
@@ -105,15 +97,6 @@ pub struct Stream {
     /// poll_read returns EOF only when recv_buf is empty AND this is true.
     /// Separated from `state` to avoid losing buffered data on FIN.
     peer_fin: Arc<std::sync::atomic::AtomicBool>,
-
-    // ── Congestion control fields ──────────────────────────────────────────
-
-    /// Sender-side congestion window (bytes).
-    /// Effective send window = min(send_window, cong_wnd).
-    cong_wnd: Arc<AtomicUsize>,
-
-    /// Slow-start threshold (bytes).
-    ssthresh: Arc<AtomicUsize>,
 }
 
 impl Stream {
@@ -136,8 +119,6 @@ impl Stream {
             next_recv_seq: Arc::new(AtomicU32::new(0)),
             unacked: Arc::new(Mutex::new(VecDeque::new())),
             peer_fin: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cong_wnd: Arc::new(AtomicUsize::new(INITIAL_CONG_WND)),
-            ssthresh: Arc::new(AtomicUsize::new(INITIAL_SSTHRESH)),
         };
 
         // Spawn retransmit timer
@@ -343,16 +324,13 @@ impl Stream {
         }
     }
 
-    /// Retransmit loop with adaptive congestion window.
+    /// Retransmit loop — resends unacked segments every RETRANSMIT_TIMEOUT_MS.
     ///
-    /// Ironwood's delivery queue drops the largest packet when the oldest
-    /// exceeds 25ms.  Sending a burst of retransmits floods the queue and
-    /// all of them get dropped.
-    ///
-    /// Strategy:
-    /// - Start with cwnd=1 segment per tick.
+    /// Adaptive retransmit burst size (cwnd 1..8 segments per tick):
     /// - When ACK advances (progress), double cwnd (up to 8).
     /// - When ACK stalls for 2+ ticks, reset cwnd=1.
+    ///
+    /// In-flight cap is handled statically by MAX_INFLIGHT in poll_write.
     async fn retransmit_loop(&self) {
         let interval = tokio::time::Duration::from_millis(RETRANSMIT_TIMEOUT_MS);
         let mut cwnd: usize = 1;
@@ -388,52 +366,14 @@ impl Stream {
                 continue;
             }
 
-            // ── Congestion control: adjust cong_wnd based on ACK progress ────
+            // Adaptive retransmit cwnd: track whether ACK is advancing
             if ack_seq > prev_ack {
-                let bytes_acked = (ack_seq - prev_ack) as usize;
                 stall_ticks = 0;
                 cwnd = (cwnd * 2).min(8);
-
-                // Grow congestion window
-                let cur_cong = self.cong_wnd.load(Ordering::Acquire);
-                let ssthresh = self.ssthresh.load(Ordering::Acquire);
-                let new_cong = if cur_cong < ssthresh {
-                    // Slow start: grow by bytes_acked (exponential)
-                    cur_cong + bytes_acked
-                } else {
-                    // Congestion avoidance: grow by MSS * bytes_acked / cong_wnd (linear)
-                    let increment = (MAX_DATA_SIZE * bytes_acked) / cur_cong.max(1);
-                    cur_cong + increment.max(1)
-                };
-                let capped = new_cong.min(MAX_CONG_WND);
-                self.cong_wnd.store(capped, Ordering::Release);
-                // Unblock poll_write — more window space available
-                self.write_notify.notify_one();
             } else {
                 stall_ticks += 1;
-                if stall_ticks == 2 {
-                    // Multiplicative decrease — halve once at the start of a stall.
-                    let cur_cong = self.cong_wnd.load(Ordering::Acquire);
-                    let new_ssthresh = (cur_cong / 2).max(MIN_CONG_WND);
-                    self.ssthresh.store(new_ssthresh, Ordering::Release);
-                    self.cong_wnd.store(new_ssthresh, Ordering::Release);
+                if stall_ticks >= 2 {
                     cwnd = 1;
-                    debug!(
-                        "Congestion: stall detected, cong_wnd {} -> {}, ssthresh={}",
-                        cur_cong, new_ssthresh, new_ssthresh
-                    );
-                } else if stall_ticks == 20 {
-                    // Sustained stall (~3s) — cut harder to MIN_CONG_WND.
-                    // The initial halving wasn't enough; the relay is still
-                    // dropping everything.
-                    let cur_cong = self.cong_wnd.load(Ordering::Acquire);
-                    if cur_cong > MIN_CONG_WND {
-                        self.ssthresh.store(MIN_CONG_WND, Ordering::Release);
-                        self.cong_wnd.store(MIN_CONG_WND, Ordering::Release);
-                        debug!(
-                            "Congestion: sustained stall, cong_wnd {} -> {}", cur_cong, MIN_CONG_WND
-                        );
-                    }
                 }
             }
             prev_ack = ack_seq;
@@ -674,16 +614,15 @@ impl AsyncWrite for Stream {
             return Poll::Pending;
         }
 
-        // Limit in-flight data: effective window = min(receiver window, congestion window).
-        // This prevents overwhelming the Ironwood relay whose queue drops packets > 25ms old.
+        // Limit in-flight data to MAX_INFLIGHT to avoid overwhelming the
+        // Ironwood relay (drops packets when queue age exceeds ~25ms).
         let next_seq = this.next_send_seq.load(Ordering::Acquire);
         let ack_seq_val = this.send_ack_seq.load(Ordering::Acquire);
         let in_flight = next_seq.saturating_sub(ack_seq_val) as usize;
-        let cong_wnd = this.cong_wnd.load(Ordering::Acquire);
-        let effective_wnd = window.min(cong_wnd);
+        let effective_wnd = window.min(MAX_INFLIGHT);
         let available = effective_wnd.saturating_sub(in_flight);
         if available == 0 {
-            trace!("poll_write: in_flight={} >= effective_wnd={} (wnd={} cwnd={}), waiting", in_flight, effective_wnd, window, cong_wnd);
+            trace!("poll_write: in_flight={} >= effective_wnd={}, waiting", in_flight, effective_wnd);
             let waker = cx.waker().clone();
             let notify = this.write_notify.clone();
             tokio::spawn(async move {
