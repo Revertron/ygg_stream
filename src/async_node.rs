@@ -403,6 +403,24 @@ impl AsyncNode {
         serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Number of currently active (connected) Yggdrasil peer connections.
+    ///
+    /// Note: `Core::get_peers()` includes configured-but-disconnected peers with
+    /// `up: false`.  We count only the ones that are actually up.
+    pub async fn count_active_peers(&self) -> usize {
+        self.core.get_peers().await.into_iter().filter(|p| p.up).count()
+    }
+
+    /// Returns the URI and routing cost of the first currently-up peer,
+    /// or `None` if no peer is connected.
+    pub async fn get_first_active_peer(&self) -> Option<(String, u64)> {
+        self.core.get_peers().await
+            .into_iter()
+            .filter(|p| p.up)
+            .next()
+            .map(|p| (p.uri, p.cost))
+    }
+
     /// Subscribe to peer connect/disconnect events from the underlying core.
     pub fn subscribe_peer_events(&self) -> tokio::sync::broadcast::Receiver<yggdrasil::links::PeerEvent> {
         self.core.as_ref().subscribe_peer_events()

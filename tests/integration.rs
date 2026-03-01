@@ -25,7 +25,7 @@ async fn create_node_with_listener(port: u16) -> Arc<Core> {
     core.start().await;
 
     // Give the listener time to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     core
 }
@@ -42,7 +42,7 @@ async fn create_node_with_peer(peer_addr: &str) -> Arc<Core> {
     core.start().await;
 
     // Give the connection time to establish at the TCP level
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     core
 }
@@ -78,7 +78,7 @@ async fn test_tcp_connectivity_and_streams() {
 
     // Accept the incoming stream on node 1 via the listener
     let mut stream1 = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         listener1.accept()
     )
     .await
@@ -92,7 +92,7 @@ async fn test_tcp_connectivity_and_streams() {
 
     let mut buf = vec![0u8; 1024];
     let n = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         stream1.read(&mut buf)
     )
     .await
@@ -107,7 +107,7 @@ async fn test_tcp_connectivity_and_streams() {
     buf.clear();
     buf.resize(1024, 0);
     let n = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         stream2.read(&mut buf)
     )
     .await
@@ -180,7 +180,7 @@ async fn test_tcp_datagram_send_recv() {
     let addr2 = core2.packet_conn().local_addr();
 
     // Wait 2 seconds before the nodes establish routing
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let manager1 = StreamManager::new(core1.packet_conn());
     let manager2 = StreamManager::new(core2.packet_conn());
@@ -192,12 +192,12 @@ async fn test_tcp_datagram_send_recv() {
     let msg = b"hello datagram!";
     for _ in 0..10 {
         let _ = manager2.send_datagram(&addr1, TEST_PORT, msg.to_vec()).await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     // Receive at least one datagram on node 1
     let (data, sender) = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         dg_listener1.recv(),
     )
     .await
@@ -242,7 +242,7 @@ async fn test_tcp_stale_connection_reconnect() {
     let mut stream2a = connection2a.open_stream(TEST_PORT).await.unwrap();
 
     let mut stream1a = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         listener1.accept(),
     )
     .await
@@ -255,7 +255,7 @@ async fn test_tcp_stale_connection_reconnect() {
 
     let mut buf = vec![0u8; 64];
     let n = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         stream1a.read(&mut buf),
     )
     .await
@@ -276,7 +276,7 @@ async fn test_tcp_stale_connection_reconnect() {
     let mut stream2b = connection2b.open_stream(TEST_PORT).await.unwrap();
 
     let mut stream1b = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         listener1.accept(),
     )
     .await
@@ -290,7 +290,7 @@ async fn test_tcp_stale_connection_reconnect() {
     buf.clear();
     buf.resize(64, 0);
     let n = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         stream1b.read(&mut buf),
     )
     .await
@@ -331,7 +331,7 @@ async fn test_tcp_bidirectional_multiple_streams() {
 
     // Accept the stream on node 1 via listener
     let mut stream_from_2 = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         listener1.accept()
     )
     .await
@@ -345,7 +345,7 @@ async fn test_tcp_bidirectional_multiple_streams() {
 
     // Accept the stream from node 1 on node 2 via listener
     let mut stream_from_1 = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         listener2.accept()
     )
     .await
@@ -364,7 +364,7 @@ async fn test_tcp_bidirectional_multiple_streams() {
     // Verify data arrived
     let mut buf = vec![0u8; 1024];
     let n = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         stream_from_2.read(&mut buf)
     )
     .await
@@ -375,7 +375,7 @@ async fn test_tcp_bidirectional_multiple_streams() {
     buf.clear();
     buf.resize(1024, 0);
     let n = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         stream_from_1.read(&mut buf)
     )
     .await
@@ -413,7 +413,7 @@ async fn test_tcp_concurrent_clients() {
 
         for _ in 0..NUM_CLIENTS {
             let mut stream = tokio::time::timeout(
-                tokio::time::Duration::from_secs(30),
+                Duration::from_secs(30),
                 server_listener.accept(),
             )
             .await
@@ -426,7 +426,7 @@ async fn test_tcp_concurrent_clients() {
                 for _ in 0..NUM_MESSAGES {
                     // Read client request
                     let n = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(10),
+                        Duration::from_secs(10),
                         stream.read(&mut buf),
                     )
                     .await
@@ -463,7 +463,7 @@ async fn test_tcp_concurrent_clients() {
             let client_manager = StreamManager::new(client_core.packet_conn());
 
             let connection = tokio::time::timeout(
-                tokio::time::Duration::from_secs(15),
+                Duration::from_secs(15),
                 client_manager.connect(server_addr),
             )
             .await
@@ -471,7 +471,7 @@ async fn test_tcp_concurrent_clients() {
             .unwrap();
 
             let mut stream = tokio::time::timeout(
-                tokio::time::Duration::from_secs(15),
+                Duration::from_secs(15),
                 connection.open_stream(TEST_PORT),
             )
             .await
@@ -485,27 +485,18 @@ async fn test_tcp_concurrent_clients() {
                 stream.flush().await.unwrap();
 
                 let n = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
+                    Duration::from_secs(10),
                     stream.read(&mut buf),
                 )
                 .await
                 .unwrap_or_else(|_| {
-                    panic!(
-                        "Client {} timed out reading reply for msg {}",
-                        client_id, msg_idx
-                    )
+                    panic!("Client {} timed out reading reply for msg {}", client_id, msg_idx)
                 })
                 .unwrap();
                 assert!(n > 0, "Client {} got 0-byte read for msg {}", client_id, msg_idx);
 
                 let expected = format!("reply:{}", msg);
-                assert_eq!(
-                    &buf[..n],
-                    expected.as_bytes(),
-                    "Client {} message {} mismatch",
-                    client_id,
-                    msg_idx,
-                );
+                assert_eq!(&buf[..n], expected.as_bytes(), "Client {} message {} mismatch", client_id, msg_idx);
             }
 
             stream.shutdown().await.unwrap();
@@ -521,7 +512,7 @@ async fn test_tcp_concurrent_clients() {
     }
 
     // Wait for server
-    tokio::time::timeout(tokio::time::Duration::from_secs(10), server_handle)
+    tokio::time::timeout(Duration::from_secs(10), server_handle)
         .await
         .expect("Server timed out finishing")
         .expect("Server panicked");

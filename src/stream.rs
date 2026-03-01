@@ -6,9 +6,9 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +52,10 @@ pub struct Stream {
     /// Stream state
     state: Arc<Mutex<StreamState>>,
 
-    /// Notify when data arrives for reading
-    read_notify: Arc<Notify>,
-
-    /// Notify when window space becomes available for writing
-    write_notify: Arc<Notify>,
-
-    /// Notify when stream is closed
-    close_notify: Arc<Notify>,
+    /// Registered wakers (None = no one waiting)
+    read_waker: Arc<Mutex<Option<Waker>>>,
+    write_waker: Arc<Mutex<Option<Waker>>>,
+    close_waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl Stream {
@@ -74,9 +70,9 @@ impl Stream {
             recv_window: Arc::new(AtomicU32::new(DEFAULT_WINDOW_SIZE)),
             outgoing,
             state: Arc::new(Mutex::new(StreamState::Opening)),
-            read_notify: Arc::new(Notify::new()),
-            write_notify: Arc::new(Notify::new()),
-            close_notify: Arc::new(Notify::new()),
+            read_waker: Arc::new(Mutex::new(None)),
+            write_waker: Arc::new(Mutex::new(None)),
+            close_waker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -104,7 +100,7 @@ impl Stream {
     pub(crate) async fn transition_to_open(&self) {
         let mut state = self.state.lock().await;
         *state = StreamState::Open;
-        self.write_notify.notify_one();
+        self.wake_writer();
     }
 
     /// Handle incoming packet
@@ -118,7 +114,7 @@ impl Stream {
                     *state = StreamState::Open;
                     // Update send window from SYN-ACK
                     self.send_window.store(packet.window, Ordering::Release);
-                    self.write_notify.notify_one();
+                    self.wake_writer();
                     Ok(())
                 } else {
                     Err(Error::Protocol(format!(
@@ -131,17 +127,17 @@ impl Stream {
                 if packet.is_rst() {
                     // Stream reset by peer
                     *state = StreamState::Closed;
-                    self.read_notify.notify_waiters();
-                    self.write_notify.notify_waiters();
-                    self.close_notify.notify_waiters();
+                    self.wake_reader();  // Instead of read_notify.notify_waiters()
+                    self.wake_writer();
+                    self.wake_closer();
                     return Err(Error::StreamReset);
                 }
 
                 if packet.is_fin() {
                     // Peer initiated close - send FIN back and transition to Closed
                     *state = StreamState::Closed;
-                    self.read_notify.notify_waiters();
-                    self.close_notify.notify_waiters();
+                    self.wake_reader();
+                    self.wake_closer();
 
                     // Release the lock before sending FIN
                     drop(state);
@@ -156,14 +152,13 @@ impl Stream {
                 // Update send window if ACK
                 if packet.is_ack() {
                     self.send_window.store(packet.window, Ordering::Release);
-                    self.write_notify.notify_one();
+                    self.wake_writer();  // Writer might have room now
                 }
 
                 // Deliver data if present
                 if !packet.data.is_empty() {
                     let mut recv_buf = self.recv_buf.lock().await;
                     recv_buf.extend(&packet.data);
-                    self.read_notify.notify_one();
 
                     // Update our receive window
                     let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len() as u32);
@@ -171,6 +166,7 @@ impl Stream {
 
                     // Send ACK with updated window
                     drop(recv_buf); // Release lock before sending
+                    self.wake_reader();  // Data available!
                     self.send_ack().await?;
                 }
 
@@ -180,7 +176,7 @@ impl Stream {
                 if packet.is_fin() {
                     // Both sides closed
                     *state = StreamState::Closed;
-                    self.close_notify.notify_waiters();
+                    self.wake_closer();
                 }
                 Ok(())
             }
@@ -223,9 +219,9 @@ impl Stream {
         let packet = Packet::rst(self.port, self.id);
         let _ = self.outgoing.send(packet).await;
 
-        self.read_notify.notify_waiters();
-        self.write_notify.notify_waiters();
-        self.close_notify.notify_waiters();
+        self.wake_reader();
+        self.wake_writer();
+        self.wake_closer();
 
         Ok(())
     }
@@ -239,7 +235,7 @@ impl Stream {
             StreamState::Closing => {
                 // Already closing, wait for completion
                 drop(state);
-                self.close_notify.notified().await;
+                self.wake_closer();
                 return Ok(());
             }
             _ => {}
@@ -255,7 +251,7 @@ impl Stream {
         drop(state);
 
         // Wait for peer's FIN
-        self.close_notify.notified().await;
+        self.wake_closer();
         Ok(())
     }
 
@@ -263,29 +259,53 @@ impl Stream {
     pub async fn is_closed(&self) -> bool {
         *self.state.lock().await == StreamState::Closed
     }
+
+    /// Wake registered reader if any
+    fn wake_reader(&self) {
+        if let Ok(mut waker) = self.read_waker.try_lock() {
+            if let Some(w) = waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    /// Wake registered writer if any
+    fn wake_writer(&self) {
+        if let Ok(mut waker) = self.write_waker.try_lock() {
+            if let Some(w) = waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    /// Wake registered close waiter if any
+    fn wake_closer(&self) {
+        if let Ok(mut waker) = self.close_waker.try_lock() {
+            if let Some(w) = waker.take() {
+                w.wake();
+            }
+        }
+    }
 }
 
 impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Try to lock recv_buf
+        // Try non-blocking lock on recv_buf
         let mut recv_buf = match this.recv_buf.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                // Lock contention, register waker and return pending
-                this.read_notify.notify_one();
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
         };
 
-        // Check if we have data available
+        // Data available? Return immediately
         if !recv_buf.is_empty() {
             let to_read = std::cmp::min(buf.remaining(), recv_buf.len());
-
-            // Copy directly from VecDeque slices to avoid an intermediate Vec allocation.
             let (head, tail) = recv_buf.as_slices();
+
             if to_read <= head.len() {
                 buf.put_slice(&head[..to_read]);
             } else {
@@ -294,20 +314,19 @@ impl AsyncRead for Stream {
             }
             drop(recv_buf.drain(..to_read));
 
-            // Shrink the VecDeque when fully drained to release memory
-            // after large transfers.
             if recv_buf.is_empty() {
                 recv_buf.shrink_to_fit();
             }
 
-            // Update receive window
             let available = DEFAULT_WINDOW_SIZE.saturating_sub(recv_buf.len() as u32);
             this.recv_window.store(available, Ordering::Release);
 
             return Poll::Ready(Ok(()));
         }
 
-        // No data available, check stream state
+        // No data - check state
+        drop(recv_buf); // Release lock before checking state
+
         let state = match this.state.try_lock() {
             Ok(guard) => *guard,
             Err(_) => {
@@ -317,18 +336,17 @@ impl AsyncRead for Stream {
         };
 
         match state {
-            StreamState::Closed | StreamState::Closing => {
-                // Stream closed or closing, return EOF (no data)
-                Poll::Ready(Ok(()))
-            }
+            StreamState::Closed | StreamState::Closing => Poll::Ready(Ok(())),
             _ => {
-                // Wait for data
-                let waker = cx.waker().clone();
-                let notify = this.read_notify.clone();
-                tokio::spawn(async move {
-                    notify.notified().await;
-                    waker.wake();
-                });
+                // Register waker to be woken when data arrives
+                match this.read_waker.try_lock() {
+                    Ok(mut waker) => {
+                        *waker = Some(cx.waker().clone());
+                    }
+                    Err(_) => {
+                        cx.waker().wake_by_ref();
+                    }
+                }
                 Poll::Pending
             }
         }
@@ -336,10 +354,9 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        // Check stream state
         let state = match this.state.try_lock() {
             Ok(guard) => *guard,
             Err(_) => {
@@ -356,79 +373,66 @@ impl AsyncWrite for Stream {
         }
 
         if state != StreamState::Open {
-            // Wait for stream to open
-            let waker = cx.waker().clone();
-            let notify = this.write_notify.clone();
-            tokio::spawn(async move {
-                notify.notified().await;
-                waker.wake();
-            });
+            // Register waker for when state changes to Open
+            match this.write_waker.try_lock() {
+                Ok(mut waker) => *waker = Some(cx.waker().clone()),
+                Err(_) => cx.waker().wake_by_ref(),
+            }
             return Poll::Pending;
         }
 
-        // Check available window
         let window = this.send_window.load(Ordering::Acquire);
         if window == 0 {
-            // No space available, wait for ACK
-            let waker = cx.waker().clone();
-            let notify = this.write_notify.clone();
-            tokio::spawn(async move {
-                notify.notified().await;
-                waker.wake();
-            });
+            // Register waker for when window opens
+            match this.write_waker.try_lock() {
+                Ok(mut waker) => *waker = Some(cx.waker().clone()),
+                Err(_) => cx.waker().wake_by_ref(),
+            }
             return Poll::Pending;
         }
 
-        // Send what we can within the window, clamped to MAX_DATA_SIZE per packet
         let to_send = buf.len().min(window as usize).min(MAX_DATA_SIZE);
         let data = buf[..to_send].to_vec();
         let window_after = this.recv_window.load(Ordering::Acquire);
         let packet = Packet::data_ack(this.port, this.id, data, window_after);
 
-        // Decrease send window
         this.send_window.fetch_sub(to_send as u32, Ordering::Release);
 
-        // Send packet synchronously to preserve ordering.
         match this.outgoing.try_send(packet) {
             Ok(()) => Poll::Ready(Ok(to_send)),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                // Channel full — undo the window decrement and retry later
                 this.send_window.fetch_add(to_send as u32, Ordering::Release);
+                // Register waker for when channel has space
                 let waker = cx.waker().clone();
                 let outgoing = this.outgoing.clone();
+                // For channel backpressure, we still need to spawn or use a different mechanism
+                // Option: store waker and have a separate task that polls channel readiness
                 tokio::spawn(async move {
-                    // Wait until the channel has capacity, then wake
                     let _ = outgoing.reserve().await;
                     waker.wake();
                 });
                 Poll::Pending
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "outgoing channel closed",
-                )))
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "outgoing channel closed",
+            ))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // No internal write buffer; flush is a no-op
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>,cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Initiate graceful close
         let state = match this.state.try_lock() {
             Ok(mut guard) => {
                 let current = *guard;
                 if current == StreamState::Open {
                     *guard = StreamState::Closing;
                     drop(guard);
-
-                    // Send FIN packet
                     let packet = Packet::fin(this.port, this.id);
                     let _ = this.outgoing.try_send(packet);
                 }
@@ -444,13 +448,11 @@ impl AsyncWrite for Stream {
             return Poll::Ready(Ok(()));
         }
 
-        // Wait for close to complete
-        let waker = cx.waker().clone();
-        let notify = this.close_notify.clone();
-        tokio::spawn(async move {
-            notify.notified().await;
-            waker.wake();
-        });
+        // Register waker for close completion
+        match this.close_waker.try_lock() {
+            Ok(mut waker) => *waker = Some(cx.waker().clone()),
+            Err(_) => cx.waker().wake_by_ref(),
+        }
         Poll::Pending
     }
 }
