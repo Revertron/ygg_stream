@@ -3016,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "ed25519-dalek",

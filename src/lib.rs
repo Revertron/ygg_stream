@@ -50,11 +50,13 @@
 //! ```
 
 // UniFFI scaffolding — must be in the crate root.
+#[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!("ygg_stream");
 
 pub mod async_node;
 pub mod connection;
 pub mod error;
+#[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod manager;
 pub mod node;
