@@ -626,7 +626,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1003,7 +1003,8 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
 name = "ironwood"
-version = "0.1.1"
+version = "0.1.2"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?tag=v0.1.2#a66c396dcc13bbd7fd96a7db3cc49440fefe2f88"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1278,7 +1279,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1630,7 +1631,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1934,7 +1935,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3015,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "ygg_stream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ed25519-dalek",
@@ -3035,7 +3036,8 @@ dependencies = [
 
 [[package]]
 name = "yggdrasil"
-version = "0.1.1"
+version = "0.1.2"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?tag=v0.1.2#a66c396dcc13bbd7fd96a7db3cc49440fefe2f88"
 dependencies = [
  "blake2",
  "comfy-table",

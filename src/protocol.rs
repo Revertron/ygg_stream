@@ -8,29 +8,45 @@ pub const FLAG_FIN: u8 = 0x04; // Close stream gracefully
 pub const FLAG_RST: u8 = 0x08; // Reset stream (abort)
 pub const FLAG_DGRAM: u8 = 0x10; // Connectionless datagram
 
-/// Default flow control window size (256 KB)
-pub const DEFAULT_WINDOW_SIZE: u32 = 256 * 1024;
+/// Default flow control window size (512 KB)
+pub const DEFAULT_WINDOW_SIZE: usize = 512 * 1024;
 
 /// Maximum packet size (64 KB - 1 byte)
 pub const MAX_PACKET_SIZE: usize = 65535;
 
-/// Maximum data payload per packet (accounting for 11-byte header)
-pub const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - HEADER_YGGDRASIL;
-
-/// Packet header size (port+stream_id + flags + window + length)
-pub const HEADER_SIZE: usize = 11;
+/// Packet header size:
+/// [port+stream_id:u32][flags:u8][seq:u32][ack_seq:u32][window:u32][length:u16]
+/// = 4 + 1 + 4 + 4 + 4 + 2 = 19 bytes
+pub const HEADER_SIZE: usize = 19;
 
 /// Yggdrasil overhead
 pub const HEADER_YGGDRASIL: usize = 131;
+
+/// Maximum data payload per packet (accounting for header + Yggdrasil overhead)
+pub const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - HEADER_YGGDRASIL;
+
+/// Preferred send chunk size.  Smaller than MAX_DATA_SIZE to reduce queuing
+/// delay at the ironwood layer (which drops packets queued longer than 25 ms).
+/// 16 KiB keeps per-packet transmission time well under that budget while
+/// keeping header overhead below 1 %.
+pub const SEND_CHUNK_SIZE: usize = 16 * 1024;
+
+/// Maximum in-flight bytes before sender blocks (512 KB)
+pub const MAX_INFLIGHT: usize = 512 * 1024;
+
+/// Retransmit timeout in milliseconds
+pub const RETRANSMIT_TIMEOUT_MS: u64 = 150;
 
 /// Protocol packet
 ///
 /// Wire format:
 /// ```text
-/// [port:u16 << 16 | stream_id:u16 : u32][flags: u8][window: u32][length: u16][data: bytes]
+/// [port:u16 << 16 | stream_id:u16 : u32][flags: u8][seq: u32][ack_seq: u32][window: u32][length: u16][data: bytes]
 /// ```
 ///
-/// The 4-byte combined field encodes `(port << 16) | stream_id`.
+/// - `seq`:     byte-level sequence number of the first byte in `data` (0 for control packets)
+/// - `ack_seq`: cumulative acknowledgment — "I have received all bytes up to this seq" (0 if no ACK)
+/// - `window`:  receiver's available buffer space in bytes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     /// Port number (high 16 bits of the wire u32)
@@ -42,11 +58,17 @@ pub struct Packet {
     /// Control flags (SYN, ACK, FIN, RST)
     pub flags: u8,
 
+    /// Byte-level sequence number of the first data byte (0 for control packets)
+    pub seq: u32,
+
+    /// Cumulative ACK: peer has received all bytes up to (not including) this seq
+    pub ack_seq: u32,
+
+    /// Receiver's available window size (for flow control)
+    pub window: usize,
+
     /// Data payload
     pub data: Vec<u8>,
-
-    /// Receiver's available window size (for flow control), transmitted on the wire
-    pub window: u32,
 }
 
 impl Packet {
@@ -56,8 +78,10 @@ impl Packet {
             port,
             stream_id,
             flags,
-            data,
+            seq: 0,
+            ack_seq: 0,
             window: DEFAULT_WINDOW_SIZE,
+            data,
         }
     }
 
@@ -76,14 +100,16 @@ impl Packet {
         Self::new(port, stream_id, 0, data)
     }
 
-    /// Create a data + ACK packet
-    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, window: u32) -> Self {
+    /// Create a data + ACK packet with sequence numbers
+    pub fn data_ack(port: u16, stream_id: u16, data: Vec<u8>, seq: u32, ack_seq: u32, window: usize) -> Self {
         Self {
             port,
             stream_id,
             flags: FLAG_ACK,
-            data,
+            seq,
+            ack_seq,
             window,
+            data,
         }
     }
 
@@ -102,14 +128,16 @@ impl Packet {
         Self::new(port, 0, FLAG_DGRAM, data)
     }
 
-    /// Create an ACK packet with window update
-    pub fn ack(port: u16, stream_id: u16, window: u32) -> Self {
+    /// Create an ACK packet with cumulative ack_seq and window update
+    pub fn ack(port: u16, stream_id: u16, ack_seq: u32, window: usize) -> Self {
         Self {
             port,
             stream_id,
             flags: FLAG_ACK,
-            data: Vec::new(),
+            seq: 0,
+            ack_seq,
             window,
+            data: Vec::new(),
         }
     }
 
@@ -140,7 +168,7 @@ impl Packet {
 
     /// Encode packet to bytes
     ///
-    /// Format: [(port << 16 | stream_id): u32][flags: u8][window: u32][length: u16][data]
+    /// Format: [(port << 16 | stream_id): u32][flags: u8][seq: u32][ack_seq: u32][window: u32][length: u16][data]
     pub fn encode(&self) -> Result<Vec<u8>> {
         let data_len = self.data.len();
         if data_len > MAX_DATA_SIZE {
@@ -156,8 +184,14 @@ impl Packet {
         // Write flags (1 byte)
         buf.put_u8(self.flags);
 
+        // Write seq (4 bytes, big-endian)
+        buf.put_u32(self.seq);
+
+        // Write ack_seq (4 bytes, big-endian)
+        buf.put_u32(self.ack_seq);
+
         // Write window (4 bytes, big-endian)
-        buf.put_u32(self.window);
+        buf.put_u32(self.window as u32);
 
         // Write length (2 bytes, big-endian)
         buf.put_u16(data_len as u16);
@@ -189,8 +223,14 @@ impl Packet {
         // Read flags (1 byte)
         let flags = cursor.get_u8();
 
+        // Read seq (4 bytes, big-endian)
+        let seq = cursor.get_u32();
+
+        // Read ack_seq (4 bytes, big-endian)
+        let ack_seq = cursor.get_u32();
+
         // Read window (4 bytes, big-endian)
-        let window = cursor.get_u32();
+        let window = cursor.get_u32() as usize;
 
         // Read length (2 bytes, big-endian)
         let length = cursor.get_u16() as usize;
@@ -211,8 +251,10 @@ impl Packet {
             port,
             stream_id,
             flags,
-            data,
+            seq,
+            ack_seq,
             window,
+            data,
         })
     }
 }
@@ -231,6 +273,8 @@ mod tests {
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.flags, FLAG_SYN | FLAG_ACK);
         assert_eq!(decoded.data, b"hello");
+        assert_eq!(decoded.seq, 0);
+        assert_eq!(decoded.ack_seq, 0);
     }
 
     #[test]
@@ -285,6 +329,36 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_data_ack_with_seq() {
+        let packet = Packet::data_ack(1, 2, b"payload".to_vec(), 100, 200, 32768);
+        assert_eq!(packet.seq, 100);
+        assert_eq!(packet.ack_seq, 200);
+        assert_eq!(packet.window, 32768);
+        assert!(packet.is_ack());
+
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.seq, 100);
+        assert_eq!(decoded.ack_seq, 200);
+        assert_eq!(decoded.window, 32768);
+        assert_eq!(decoded.data, b"payload");
+    }
+
+    #[test]
+    fn test_packet_ack_with_ack_seq() {
+        let packet = Packet::ack(1, 2, 1024, 65536);
+        assert_eq!(packet.ack_seq, 1024);
+        assert_eq!(packet.window, 65536);
+        assert!(packet.is_ack());
+        assert!(packet.data.is_empty());
+
+        let encoded = packet.encode().unwrap();
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.ack_seq, 1024);
+        assert_eq!(decoded.window, 65536);
+    }
+
+    #[test]
     fn test_packet_fin() {
         let packet = Packet::fin(1, 111);
         assert_eq!(packet.stream_id, 111);
@@ -319,7 +393,9 @@ mod tests {
         // Create packet with mismatched length field
         let mut buf = BytesMut::new();
         buf.put_u32(1); // combined port+stream_id
-        buf.put_u8(0); // flags
+        buf.put_u8(0);  // flags
+        buf.put_u32(0); // seq
+        buf.put_u32(0); // ack_seq
         buf.put_u32(0); // window
         buf.put_u16(100); // length says 100 bytes
         buf.put_slice(b"short"); // but only 5 bytes of data
@@ -397,5 +473,14 @@ mod tests {
         let decoded = Packet::decode(&encoded).unwrap();
         assert_eq!(decoded.port, 0);
         assert_eq!(decoded.stream_id, 1);
+    }
+
+    #[test]
+    fn test_header_size() {
+        // Verify the fixed header is exactly 19 bytes
+        let packet = Packet::new(1, 1, FLAG_ACK, Vec::new());
+        let encoded = packet.encode().unwrap();
+        assert_eq!(encoded.len(), HEADER_SIZE);
+        assert_eq!(HEADER_SIZE, 19);
     }
 }

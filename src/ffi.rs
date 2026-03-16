@@ -14,21 +14,31 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::node::{Conn, Node};
 
 /// Initialize tracing (Android → logcat, other platforms → stderr).
-fn init_tracing() {
+///
+/// `filter` uses `tracing_subscriber::EnvFilter` syntax, e.g.
+/// `"ygg_stream=debug,ironwood=info,yggdrasil=info"`.
+/// An empty string defaults to `"info"`.
+fn init_tracing(filter: &str) {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::EnvFilter;
+
+        let filter = if filter.is_empty() { "info" } else { filter };
+        let env_filter = EnvFilter::new(filter);
 
         #[cfg(target_os = "android")]
         {
             tracing_subscriber::registry()
+                .with(env_filter)
                 .with(tracing_android::layer("ygg_stream").unwrap())
                 .init();
         }
         #[cfg(not(target_os = "android"))]
         {
             tracing_subscriber::registry()
+                .with(env_filter)
                 .with(tracing_subscriber::fmt::layer())
                 .init();
         }
@@ -78,8 +88,8 @@ impl FfiNode {
     ///
     /// Pass an empty string to start without any initial peers.
     #[uniffi::constructor]
-    pub fn new_(peer_addr: String) -> Result<Arc<FfiNode>, YggError> {
-        //init_tracing();
+    pub fn new_(peer_addr: String, log_filter: String) -> Result<Arc<FfiNode>, YggError> {
+        init_tracing(&log_filter);
         Node::new(&peer_addr)
             .map(|m| Arc::new(FfiNode { node: m }))
             .map_err(YggError::Generic)
@@ -87,8 +97,8 @@ impl FfiNode {
 
     /// Create a node with a specific 32-byte signing key and a list of peers.
     #[uniffi::constructor]
-    pub fn new_with_key(key_bytes: Vec<u8>, peers: Vec<String>) -> Result<Arc<FfiNode>, YggError> {
-        //init_tracing();
+    pub fn new_with_key(key_bytes: Vec<u8>, peers: Vec<String>, log_filter: String) -> Result<Arc<FfiNode>, YggError> {
+        init_tracing(&log_filter);
         Node::new_with_key(&key_bytes, peers)
             .map(|m| Arc::new(FfiNode { node: m }))
             .map_err(YggError::Generic)

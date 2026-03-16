@@ -5,9 +5,7 @@ use crate::stream::Stream;
 use ironwood::{Addr, EncryptedPacketConn, PacketConn};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -582,7 +580,7 @@ async fn writer_task(
                 return Ok(());
             }
         }
-        sleep(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -641,6 +639,47 @@ mod tests {
 
         // Verify the datagram listener is registered
         assert!(manager.datagram_listeners.read().await.contains_key(&99));
+    }
+
+    /// Simulate the full datagram pipeline:
+    /// encode → decode → route → deliver
+    /// This is the same path the reader_task takes on every incoming packet.
+    #[tokio::test]
+    async fn test_datagram_encode_decode_route_deliver() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let conn = new_encrypted_packet_conn(signing_key, Default::default());
+        let manager = StreamManager::new(conn);
+
+        let payload = b"hello datagram world";
+        let sender = Addr::from([0xAB_u8; 32]);
+        let port = 42u16;
+
+        // Register listener
+        let mut listener = manager.listen_datagram(port).await;
+
+        // Simulate what the sender does: build and encode a datagram packet
+        let pkt = Packet::datagram(port, payload.to_vec());
+        let encoded = pkt.encode().unwrap();
+
+        // Simulate what the reader_task does: decode and route
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert!(decoded.is_dgram(), "packet must be identified as datagram");
+        assert_eq!(decoded.port, port);
+        assert_eq!(decoded.seq, 0, "seq must be 0 for datagrams");
+        assert_eq!(decoded.ack_seq, 0, "ack_seq must be 0 for datagrams");
+        assert_eq!(decoded.data, payload);
+
+        // Route: push into the listener channel exactly as reader_task does
+        {
+            let dg_listeners = manager.datagram_listeners.read().await;
+            let tx = dg_listeners.get(&port).unwrap();
+            tx.try_send((decoded.data, sender)).unwrap();
+        }
+
+        // Deliver: application receives (data, sender_addr)
+        let (received_data, received_addr) = listener.recv().await.unwrap();
+        assert_eq!(received_data, payload);
+        assert_eq!(received_addr, sender);
     }
 
     #[tokio::test]

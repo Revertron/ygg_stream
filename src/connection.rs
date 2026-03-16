@@ -214,24 +214,26 @@ impl Connection {
         if let Some(stream) = stream {
             let result = stream.handle_packet(packet).await;
 
-            // Always remove closed streams (handles normal FIN and RST).
-            // This must happen regardless of whether handle_packet returned an
-            // error so that stale entries do not block future streams with the
-            // same (port, stream_id) key.
-            if stream.is_closed().await {
+            // Remove closed streams. handle_packet returns Ok(true) on close,
+            // or Err(StreamReset) on RST — both mean the stream is done.
+            let closed = matches!(&result, Ok(true) | Err(crate::error::Error::StreamReset));
+            if closed {
                 let mut streams = self.streams.write().await;
                 streams.remove(&key);
                 trace!("Removed closed stream port={} id={}", port, stream_id);
             }
 
-            // StreamReset is a normal protocol event; swallow it here.
-            // Propagate any other errors.
             match result {
-                Err(crate::error::Error::StreamReset) | Ok(()) => {}
+                Err(crate::error::Error::StreamReset) | Ok(_) => {}
                 Err(e) => return Err(e),
             }
         } else {
             warn!("Received packet for unknown stream port={} id={} from peer {:?}", port, stream_id, &self.peer);
+            // Send RST to stop the sender from retransmitting into a dead stream.
+            // Guard: never RST-respond to RST or FIN to avoid packet storms.
+            if !packet.is_rst() && !packet.is_fin() {
+                let _ = self.outgoing.send(Packet::rst(port, stream_id)).await;
+            }
         }
 
         Ok(true)

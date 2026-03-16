@@ -144,6 +144,17 @@ impl AsyncConn {
         let mut s = self.stream.clone();
         let _ = tokio::time::timeout(Duration::from_secs(5), s.shutdown()).await;
     }
+
+    /// Abort the stream immediately by sending RST.
+    ///
+    /// Unlike [`close`](Self::close), this does not wait for acknowledgement.
+    /// It immediately transitions the stream to `Closed`, wakes any pending
+    /// reads/writes, and sends an RST packet to the peer.  Use this when a
+    /// request times out, and you need the reader task to unblock right away.
+    pub async fn abort(&self) {
+        let s = self.stream.clone();
+        let _ = s.abort().await;
+    }
 }
 
 // ── AsyncNode ────────────────────────────────────────────────────────────────
