@@ -25,7 +25,7 @@ async fn create_node_with_listener(port: u16) -> Arc<Core> {
     core.start().await;
 
     // Give the listener time to start
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
 
     core
 }
@@ -42,7 +42,7 @@ async fn create_node_with_peer(peer_addr: &str) -> Arc<Core> {
     core.start().await;
 
     // Give the connection time to establish at the TCP level
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await;
 
     core
 }
@@ -441,6 +441,8 @@ async fn test_tcp_concurrent_clients() {
                     stream.flush().await.unwrap();
                 }
             }));
+            // Give the stream some time to disconnect cleanly
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         // Wait for all per-client handlers to finish

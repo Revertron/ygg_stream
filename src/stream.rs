@@ -515,6 +515,11 @@ impl AsyncRead for Stream {
             }
         }
 
+        // Connection dead (writer task gone) — treat as EOF
+        if this.outgoing.is_closed() {
+            return Poll::Ready(Ok(()));
+        }
+
         // Store waker THEN re-check recv_buf to avoid lost-wakeup race:
         // handle_packet may have written data and called wake_reader() between
         // our empty-buffer check above and this point.
@@ -530,6 +535,14 @@ impl AsyncRead for Stream {
                 }
             }
         }
+
+        // Re-check: channel may have closed while we were storing the waker
+        if this.outgoing.is_closed() {
+            if let Some(w) = this.read_waker.lock().unwrap().take() {
+                w.wake();
+            }
+        }
+
         Poll::Pending
     }
 }
@@ -581,7 +594,7 @@ impl AsyncWrite for Stream {
             let ack_seq2 = this.send_ack_seq.load(Ordering::Acquire);
             let in_flight2 = next_seq.wrapping_sub(ack_seq2) as usize;
             let effective2 = send_window2.min(MAX_INFLIGHT);
-            if effective2.saturating_sub(in_flight2) > 0 {
+            if effective2.saturating_sub(in_flight2) > 0 || this.outgoing.is_closed() {
                 if let Some(w) = this.write_waker.lock().unwrap().take() {
                     w.wake();
                 }
@@ -610,8 +623,6 @@ impl AsyncWrite for Stream {
                     .lock()
                     .unwrap()
                     .push_back(UnackedSegment { seq, data });
-                this.send_window
-                    .fetch_sub(to_send as u32, Ordering::Release);
                 Poll::Ready(Ok(to_send))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -639,17 +650,29 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>,cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        // If the outgoing channel is closed (writer task dead / connection gone),
+        // we can never send FIN or receive ACKs — just transition to Closed.
+        if this.outgoing.is_closed() {
+            if let Ok(mut g) = this.state.try_lock() {
+                *g = StreamState::Closed;
+            }
+            return Poll::Ready(Ok(()));
+        }
 
         // Wait until all sent data has been acknowledged before sending FIN
         let next_seq = this.next_send_seq.load(Ordering::Acquire);
         let ack_seq = this.send_ack_seq.load(Ordering::Acquire);
         if ack_seq < next_seq {
             *this.write_waker.lock().unwrap() = Some(cx.waker().clone());
+            // Re-check: channel may have closed while we stored the waker
+            if this.outgoing.is_closed() {
+                if let Some(w) = this.write_waker.lock().unwrap().take() {
+                    w.wake();
+                }
+            }
             return Poll::Pending;
         }
 
@@ -680,6 +703,12 @@ impl AsyncWrite for Stream {
         }
 
         *this.close_waker.lock().unwrap() = Some(cx.waker().clone());
+        // Re-check: channel may have closed while we stored the waker
+        if this.outgoing.is_closed() {
+            if let Some(w) = this.close_waker.lock().unwrap().take() {
+                w.wake();
+            }
+        }
         Poll::Pending
     }
 }
