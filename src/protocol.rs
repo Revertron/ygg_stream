@@ -34,6 +34,9 @@ pub const SEND_CHUNK_SIZE: usize = 16 * 1024;
 /// Maximum in-flight bytes before sender blocks (512 KB)
 pub const MAX_INFLIGHT: usize = 512 * 1024;
 
+/// Initial congestion window (2 segments = 32 KB)
+pub const INITIAL_CWND: usize = 2 * SEND_CHUNK_SIZE;
+
 /// Retransmit timeout in milliseconds
 pub const RETRANSMIT_TIMEOUT_MS: u64 = 150;
 

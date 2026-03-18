@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Packet, DEFAULT_WINDOW_SIZE, MAX_INFLIGHT, RETRANSMIT_TIMEOUT_MS, SEND_CHUNK_SIZE,
+    Packet, DEFAULT_WINDOW_SIZE, INITIAL_CWND, MAX_INFLIGHT, RETRANSMIT_TIMEOUT_MS,
+    SEND_CHUNK_SIZE,
 };
 use ironwood::Addr;
 use std::collections::{BTreeMap, VecDeque};
@@ -93,6 +94,12 @@ pub struct Stream {
     /// Last ACK value seen (for dup-ACK detection, sender side).
     last_dup_ack: Arc<AtomicU32>,
 
+    /// Congestion window in bytes (TCP Reno style). Starts at INITIAL_CWND.
+    cwnd: Arc<AtomicU32>,
+
+    /// Slow-start threshold in bytes. Once cwnd >= ssthresh, growth becomes linear.
+    ssthresh: Arc<AtomicU32>,
+
     // --- Stored wakers (std::sync::Mutex — fast, no await, no spawned tasks) ---
     read_waker: Arc<Mutex<Option<Waker>>>,
     write_waker: Arc<Mutex<Option<Waker>>>,
@@ -119,6 +126,8 @@ impl Stream {
             ooo_buf: Arc::new(Mutex::new(BTreeMap::new())),
             dup_ack_count: Arc::new(AtomicU32::new(0)),
             last_dup_ack: Arc::new(AtomicU32::new(0)),
+            cwnd: Arc::new(AtomicU32::new(INITIAL_CWND as u32)),
+            ssthresh: Arc::new(AtomicU32::new(MAX_INFLIGHT as u32)),
             read_waker: Arc::new(Mutex::new(None)),
             write_waker: Arc::new(Mutex::new(None)),
             close_waker: Arc::new(Mutex::new(None)),
@@ -231,9 +240,27 @@ impl Stream {
                 }
                 self.dup_ack_count.store(0, Ordering::Release);
                 self.last_dup_ack.store(new_ack, Ordering::Release);
+
+                // Grow congestion window (TCP Reno)
+                let cwnd_val = self.cwnd.load(Ordering::Acquire);
+                let ssthresh_val = self.ssthresh.load(Ordering::Acquire);
+                let new_cwnd = if cwnd_val < ssthresh_val {
+                    // Slow start: grow by one segment per ACK (doubles per RTT)
+                    cwnd_val + SEND_CHUNK_SIZE as u32
+                } else {
+                    // Congestion avoidance: grow ~1 segment per RTT
+                    cwnd_val + (SEND_CHUNK_SIZE as u32 * SEND_CHUNK_SIZE as u32) / cwnd_val.max(1)
+                };
+                self.cwnd.store(new_cwnd.min(MAX_INFLIGHT as u32), Ordering::Release);
             } else if new_ack == old_ack && old_ack > 0 {
                 let count = self.dup_ack_count.fetch_add(1, Ordering::AcqRel) + 1;
                 if count == 3 {
+                    // Multiplicative decrease on triple dup-ACK
+                    let cwnd_val = self.cwnd.load(Ordering::Acquire);
+                    let half = (cwnd_val / 2).max(SEND_CHUNK_SIZE as u32);
+                    self.ssthresh.store(half, Ordering::Release);
+                    self.cwnd.store(half, Ordering::Release);
+
                     let seg = self.unacked.lock().unwrap().front()
                         .map(|s| (s.seq, s.data.clone()));
                     if let Some((seq, data)) = seg {
@@ -402,7 +429,6 @@ impl Stream {
 
         let mut last_ack: u32 = 0;
         let mut stall_ticks: u32 = 0;
-        let mut cwnd: usize = 16;
 
         loop {
             ticker.tick().await;
@@ -414,7 +440,6 @@ impl Stream {
             let current_ack = self.send_ack_seq.load(Ordering::Acquire);
             if current_ack > last_ack {
                 // ACK progress — no retransmission needed
-                cwnd = 16;
                 stall_ticks = 0;
                 last_ack = current_ack;
                 continue;
@@ -428,17 +453,22 @@ impl Stream {
 
             stall_ticks += 1;
 
-            // First stall tick: retransmit aggressively (all unacked)
-            // Subsequent ticks: halve cwnd (multiplicative decrease), minimum 1
-            if stall_ticks > 1 {
-                cwnd = (cwnd / 2).max(1);
+            // First stall tick: timeout — reset cwnd to one segment (slow start)
+            if stall_ticks == 1 {
+                let cwnd_val = self.cwnd.load(Ordering::Acquire);
+                let half = (cwnd_val / 2).max(SEND_CHUNK_SIZE as u32);
+                self.ssthresh.store(half, Ordering::Release);
+                self.cwnd.store(SEND_CHUNK_SIZE as u32, Ordering::Release);
             }
+
+            let cwnd_val = self.cwnd.load(Ordering::Acquire) as usize;
+            let seg_count = (cwnd_val / SEND_CHUNK_SIZE).max(1);
 
             let segments: Vec<(u32, Vec<u8>)> = {
                 let unacked = self.unacked.lock().unwrap();
                 unacked
                     .iter()
-                    .take(cwnd)
+                    .take(seg_count)
                     .map(|s| (s.seq, s.data.clone()))
                     .collect()
             };
@@ -450,7 +480,7 @@ impl Stream {
                 "Stream {}: retransmitting {} segment(s) (cwnd={}, stall_ticks={})",
                 self.id,
                 segments.len(),
-                cwnd,
+                cwnd_val,
                 stall_ticks
             );
 
@@ -463,11 +493,7 @@ impl Stream {
 }
 
 impl AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         // Try to drain recv_buf. On try_lock failure, fall through to store the waker
@@ -506,17 +532,20 @@ impl AsyncRead for Stream {
 
         // No data (or lock was busy) — check terminal conditions
         if this.peer_fin.load(Ordering::Acquire) {
+            debug!("Stream {} (port {}): poll_read EOF — peer sent FIN", this.id, this.port);
             return Poll::Ready(Ok(())); // EOF: peer sent FIN and recv_buf is empty
         }
 
         if let Ok(guard) = this.state.try_lock() {
             if *guard == StreamState::Closed {
+                debug!("Stream {} (port {}): poll_read EOF — state is Closed (RST or FIN exchange)", this.id, this.port);
                 return Poll::Ready(Ok(()));
             }
         }
 
         // Connection dead (writer task gone) — treat as EOF
         if this.outgoing.is_closed() {
+            debug!("Stream {} (port {}): poll_read EOF — outgoing channel closed (writer task dead)", this.id, this.port);
             return Poll::Ready(Ok(()));
         }
 
@@ -548,11 +577,7 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
         // On try_lock failure, treat as non-Open and wait — handle_packet will call
@@ -578,7 +603,8 @@ impl AsyncWrite for Stream {
         let next_seq = this.next_send_seq.load(Ordering::Acquire);
         let ack_seq = this.send_ack_seq.load(Ordering::Acquire);
         let in_flight = next_seq.wrapping_sub(ack_seq) as usize;
-        let effective_window = send_window.min(MAX_INFLIGHT);
+        let cwnd_val = this.cwnd.load(Ordering::Acquire) as usize;
+        let effective_window = send_window.min(cwnd_val);
         let can_send = effective_window.saturating_sub(in_flight);
 
         if can_send == 0 {
@@ -593,7 +619,8 @@ impl AsyncWrite for Stream {
             let send_window2 = this.send_window.load(Ordering::Acquire) as usize;
             let ack_seq2 = this.send_ack_seq.load(Ordering::Acquire);
             let in_flight2 = next_seq.wrapping_sub(ack_seq2) as usize;
-            let effective2 = send_window2.min(MAX_INFLIGHT);
+            let cwnd_val2 = this.cwnd.load(Ordering::Acquire) as usize;
+            let effective2 = send_window2.min(cwnd_val2);
             if effective2.saturating_sub(in_flight2) > 0 || this.outgoing.is_closed() {
                 if let Some(w) = this.write_waker.lock().unwrap().take() {
                     w.wake();
@@ -818,6 +845,10 @@ mod tests {
             stream.send_window.load(Ordering::Acquire),
             DEFAULT_WINDOW_SIZE as u32
         );
+        assert_eq!(
+            stream.cwnd.load(Ordering::Acquire),
+            INITIAL_CWND as u32
+        );
 
         let ack = Packet {
             port: 1,
@@ -890,5 +921,121 @@ mod tests {
 
         let recv_buf = stream.recv_buf.lock().await;
         assert_eq!(recv_buf.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_cwnd_slow_start_growth() {
+        let (tx, _rx) = mpsc::channel(32);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
+
+        let syn_ack = Packet::syn_ack(1, 1);
+        stream.handle_packet(syn_ack).await.unwrap();
+
+        // Simulate sending data and receiving ACKs
+        let chunk = SEND_CHUNK_SIZE as u32;
+        stream.next_send_seq.store(chunk * 4, Ordering::Release);
+
+        assert_eq!(stream.cwnd.load(Ordering::Acquire), INITIAL_CWND as u32);
+
+        // First ACK: cwnd should grow by SEND_CHUNK_SIZE (slow start)
+        {
+            let mut unacked = stream.unacked.lock().unwrap();
+            unacked.push_back(UnackedSegment { seq: 0, data: vec![0u8; SEND_CHUNK_SIZE] });
+            unacked.push_back(UnackedSegment { seq: chunk, data: vec![0u8; SEND_CHUNK_SIZE] });
+        }
+        let ack1 = Packet::ack(1, 1, chunk, DEFAULT_WINDOW_SIZE);
+        stream.handle_packet(ack1).await.unwrap();
+        assert_eq!(
+            stream.cwnd.load(Ordering::Acquire),
+            INITIAL_CWND as u32 + chunk,
+            "cwnd should grow by one segment in slow start"
+        );
+
+        // Second ACK: cwnd should grow by another SEND_CHUNK_SIZE
+        let ack2 = Packet::ack(1, 1, chunk * 2, DEFAULT_WINDOW_SIZE);
+        stream.handle_packet(ack2).await.unwrap();
+        assert_eq!(
+            stream.cwnd.load(Ordering::Acquire),
+            INITIAL_CWND as u32 + chunk * 2,
+            "cwnd should grow by one segment per ACK in slow start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cwnd_fast_retransmit_halves() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
+
+        let syn_ack = Packet::syn_ack(1, 1);
+        stream.handle_packet(syn_ack).await.unwrap();
+
+        let chunk = SEND_CHUNK_SIZE as u32;
+        // Grow cwnd first via ACKs
+        stream.next_send_seq.store(chunk * 8, Ordering::Release);
+        {
+            let mut unacked = stream.unacked.lock().unwrap();
+            for i in 0..8 {
+                unacked.push_back(UnackedSegment {
+                    seq: chunk * i,
+                    data: vec![0u8; SEND_CHUNK_SIZE],
+                });
+            }
+        }
+        // ACK first 4 segments to grow cwnd
+        for i in 1..=4 {
+            let ack = Packet::ack(1, 1, chunk * i, DEFAULT_WINDOW_SIZE);
+            stream.handle_packet(ack).await.unwrap();
+        }
+        let cwnd_before = stream.cwnd.load(Ordering::Acquire);
+        assert!(cwnd_before > INITIAL_CWND as u32);
+
+        // Now send 3 duplicate ACKs for chunk*4 (already acked up to chunk*4)
+        for _ in 0..3 {
+            let dup_ack = Packet::ack(1, 1, chunk * 4, DEFAULT_WINDOW_SIZE);
+            stream.handle_packet(dup_ack).await.unwrap();
+        }
+
+        let cwnd_after = stream.cwnd.load(Ordering::Acquire);
+        let expected_half = (cwnd_before / 2).max(chunk);
+        assert_eq!(cwnd_after, expected_half, "cwnd should be halved after 3 dup-ACKs");
+        assert_eq!(
+            stream.ssthresh.load(Ordering::Acquire),
+            expected_half,
+            "ssthresh should equal halved cwnd"
+        );
+
+        // Drain the fast-retransmit packet from the channel
+        let retransmit_pkt = rx.recv().await.unwrap();
+        assert!(retransmit_pkt.is_ack());
+    }
+
+    #[tokio::test]
+    async fn test_cwnd_timeout_resets() {
+        let (tx, _rx) = mpsc::channel(32);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
+
+        let chunk = SEND_CHUNK_SIZE as u32;
+
+        // Set cwnd to a larger value to simulate an established connection
+        stream.cwnd.store(chunk * 8, Ordering::Release);
+        stream.ssthresh.store(MAX_INFLIGHT as u32, Ordering::Release);
+
+        // Simulate what retransmit_loop does on first stall tick:
+        // ssthresh = cwnd/2, cwnd = SEND_CHUNK_SIZE
+        let cwnd_val = stream.cwnd.load(Ordering::Acquire);
+        let half = (cwnd_val / 2).max(chunk);
+        stream.ssthresh.store(half, Ordering::Release);
+        stream.cwnd.store(chunk, Ordering::Release);
+
+        assert_eq!(
+            stream.cwnd.load(Ordering::Acquire),
+            chunk,
+            "cwnd should reset to one segment on timeout"
+        );
+        assert_eq!(
+            stream.ssthresh.load(Ordering::Acquire),
+            chunk * 4,
+            "ssthresh should be half of previous cwnd"
+        );
     }
 }

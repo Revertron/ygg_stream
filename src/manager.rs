@@ -479,7 +479,7 @@ async fn reader_task(
                             continue;
                         }
 
-                        info!("New incoming connection from peer {:?}", hex::encode(&peer.as_ref()[..8]));
+                        debug!("New incoming connection from peer {:?}", hex::encode(&peer.as_ref()[..8]));
 
                         // Create connection as acceptor
                         let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
@@ -551,7 +551,7 @@ async fn writer_task(
     cancel: CancellationToken,
 ) -> Result<()> {
     let peer_hex = hex::encode(&peer.as_ref()[..8]);
-    info!("Writer task started for peer {}", peer_hex);
+    debug!("Writer task started for peer {}", peer_hex);
     let mut pkt_count = 0u64;
     loop {
         tokio::select! {
