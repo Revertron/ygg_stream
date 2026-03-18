@@ -396,7 +396,7 @@ async fn reader_task(
                 let packet = match Packet::decode(&buf[..n]) {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!("Failed to decode packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
+                        debug!("Failed to decode packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
                         continue;
                     }
                 };
