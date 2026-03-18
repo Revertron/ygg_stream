@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Packet, DEFAULT_WINDOW_SIZE, INITIAL_CWND, MAX_INFLIGHT, RETRANSMIT_TIMEOUT_MS,
-    SEND_CHUNK_SIZE,
+    Packet, DEFAULT_WINDOW_SIZE, INITIAL_CWND, MAX_INFLIGHT, MAX_RTO_MS, MAX_STALL_MS,
+    RETRANSMIT_TIMEOUT_MS, SEND_CHUNK_SIZE,
 };
 use ironwood::Addr;
 use std::collections::{BTreeMap, VecDeque};
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, trace};
 
 /// Stream state
@@ -419,19 +419,17 @@ impl Stream {
 
     /// Background retransmit timer task.
     ///
-    /// Runs every RETRANSMIT_TIMEOUT_MS ms.  Only retransmits when no ACK
-    /// progress has been made (stall detected).  On the first stall tick,
-    /// retransmit all unacked segments at once to recover quickly.
-    /// cwnd halves on each additional stall tick (multiplicative decrease).
+    /// Uses exponential backoff: RTO starts at RETRANSMIT_TIMEOUT_MS and
+    /// doubles on each consecutive stall, capped at MAX_RTO_MS.  Resets to
+    /// initial RTO when ACK progress is observed.  Gives up and closes the
+    /// stream after MAX_STALL_MS of total stall time with no ACK progress.
     async fn retransmit_loop(&self) {
-        let mut ticker = interval(Duration::from_millis(RETRANSMIT_TIMEOUT_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         let mut last_ack: u32 = 0;
-        let mut stall_ticks: u32 = 0;
+        let mut rto_ms: u64 = RETRANSMIT_TIMEOUT_MS;
+        let mut total_stall_ms: u64 = 0;
 
         loop {
-            ticker.tick().await;
+            tokio::time::sleep(Duration::from_millis(rto_ms)).await;
 
             if *self.state.lock().await == StreamState::Closed {
                 break;
@@ -439,8 +437,9 @@ impl Stream {
 
             let current_ack = self.send_ack_seq.load(Ordering::Acquire);
             if current_ack > last_ack {
-                // ACK progress — no retransmission needed
-                stall_ticks = 0;
+                // ACK progress — reset backoff
+                rto_ms = RETRANSMIT_TIMEOUT_MS;
+                total_stall_ms = 0;
                 last_ack = current_ack;
                 continue;
             }
@@ -448,13 +447,32 @@ impl Stream {
             // No ACK progress — check if there's anything to retransmit
             let unacked_empty = self.unacked.lock().unwrap().is_empty();
             if unacked_empty {
+                // Nothing in flight — reset backoff, wait for new data
+                rto_ms = RETRANSMIT_TIMEOUT_MS;
+                total_stall_ms = 0;
                 continue;
             }
 
-            stall_ticks += 1;
+            total_stall_ms += rto_ms;
 
-            // First stall tick: timeout — reset cwnd to one segment (slow start)
-            if stall_ticks == 1 {
+            // Give up after MAX_STALL_MS of no progress
+            if total_stall_ms >= MAX_STALL_MS {
+                debug!(
+                    "Stream {} (port {}): giving up after {}ms with no ACK progress, closing",
+                    self.id, self.port, total_stall_ms
+                );
+                let mut state = self.state.lock().await;
+                *state = StreamState::Closed;
+                let rst = Packet::rst(self.port, self.id);
+                let _ = self.outgoing.try_send(rst);
+                self.wake_reader();
+                self.wake_writer();
+                self.wake_closer();
+                break;
+            }
+
+            // On first timeout at this RTO level, collapse cwnd to one segment
+            if rto_ms == RETRANSMIT_TIMEOUT_MS {
                 let cwnd_val = self.cwnd.load(Ordering::Acquire);
                 let half = (cwnd_val / 2).max(SEND_CHUNK_SIZE as u32);
                 self.ssthresh.store(half, Ordering::Release);
@@ -477,17 +495,22 @@ impl Stream {
             let recv_window = self.recv_window.load(Ordering::Acquire) as usize;
 
             debug!(
-                "Stream {}: retransmitting {} segment(s) (cwnd={}, stall_ticks={})",
+                "Stream {} (port {}): retransmitting {} seg(s) (cwnd={}, rto={}ms, stalled={}ms)",
                 self.id,
+                self.port,
                 segments.len(),
                 cwnd_val,
-                stall_ticks
+                rto_ms,
+                total_stall_ms
             );
 
             for (seq, data) in segments {
                 let pkt = Packet::data_ack(self.port, self.id, data, seq, ack_seq, recv_window);
                 let _ = self.outgoing.try_send(pkt);
             }
+
+            // Exponential backoff
+            rto_ms = (rto_ms * 2).min(MAX_RTO_MS);
         }
     }
 }

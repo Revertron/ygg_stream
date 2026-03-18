@@ -37,8 +37,14 @@ pub const MAX_INFLIGHT: usize = 512 * 1024;
 /// Initial congestion window (2 segments = 32 KB)
 pub const INITIAL_CWND: usize = 2 * SEND_CHUNK_SIZE;
 
-/// Retransmit timeout in milliseconds
+/// Retransmit timeout in milliseconds (initial RTO)
 pub const RETRANSMIT_TIMEOUT_MS: u64 = 150;
+
+/// Maximum retransmit timeout in milliseconds (cap for exponential backoff)
+pub const MAX_RTO_MS: u64 = 5_000;
+
+/// Maximum total stall time before giving up (30 seconds)
+pub const MAX_STALL_MS: u64 = 30_000;
 
 /// Protocol packet
 ///
