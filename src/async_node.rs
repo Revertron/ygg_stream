@@ -50,6 +50,7 @@ use crate::StreamManager;
 ///
 /// All I/O methods are **async** — suitable for use inside a tokio runtime.
 /// This is the async counterpart of [`Conn`](crate::Conn).
+#[derive(Clone)]
 pub struct AsyncConn {
     /// The underlying stream. All fields inside are `Arc`-wrapped, so
     /// `Stream::clone()` is cheap and the clones share state.  We clone
