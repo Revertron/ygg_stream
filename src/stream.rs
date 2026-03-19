@@ -427,6 +427,7 @@ impl Stream {
         let mut last_ack: u32 = 0;
         let mut rto_ms: u64 = RETRANSMIT_TIMEOUT_MS;
         let mut total_stall_ms: u64 = 0;
+        let mut cwnd_collapsed = false;
 
         loop {
             tokio::time::sleep(Duration::from_millis(rto_ms)).await;
@@ -437,10 +438,21 @@ impl Stream {
 
             let current_ack = self.send_ack_seq.load(Ordering::Acquire);
             if current_ack > last_ack {
-                // ACK progress — reset backoff
-                rto_ms = RETRANSMIT_TIMEOUT_MS;
-                total_stall_ms = 0;
+                // ACK progress
                 last_ack = current_ack;
+                total_stall_ms = 0;
+                cwnd_collapsed = false;
+
+                let unacked_empty = self.unacked.lock().unwrap().is_empty();
+                if unacked_empty {
+                    // All data delivered — full reset
+                    rto_ms = RETRANSMIT_TIMEOUT_MS;
+                } else {
+                    // Partial progress (e.g. after fast retransmit) — halve RTO
+                    // gradually instead of snapping back to baseline, to avoid
+                    // hammering a lossy path at 150ms intervals.
+                    rto_ms = (rto_ms / 2).max(RETRANSMIT_TIMEOUT_MS);
+                }
                 continue;
             }
 
@@ -450,6 +462,7 @@ impl Stream {
                 // Nothing in flight — reset backoff, wait for new data
                 rto_ms = RETRANSMIT_TIMEOUT_MS;
                 total_stall_ms = 0;
+                cwnd_collapsed = false;
                 continue;
             }
 
@@ -471,8 +484,9 @@ impl Stream {
                 break;
             }
 
-            // On first timeout at this RTO level, collapse cwnd to one segment
-            if rto_ms == RETRANSMIT_TIMEOUT_MS {
+            // Collapse cwnd once per stall episode (not on every tick)
+            if !cwnd_collapsed {
+                cwnd_collapsed = true;
                 let cwnd_val = self.cwnd.load(Ordering::Acquire);
                 let half = (cwnd_val / 2).max(SEND_CHUNK_SIZE as u32);
                 self.ssthresh.store(half, Ordering::Release);

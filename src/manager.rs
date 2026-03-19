@@ -1,6 +1,6 @@
 use crate::connection::Connection;
 use crate::error::{Error, Result};
-use crate::protocol::{Packet, MAX_DATA_SIZE};
+use crate::protocol::{Packet, MAX_DATA_SIZE, PACING_INTERVAL_MS};
 use crate::stream::Stream;
 use ironwood::{Addr, EncryptedPacketConn, PacketConn};
 use std::collections::HashMap;
@@ -553,6 +553,8 @@ async fn writer_task(
     let peer_hex = hex::encode(&peer.as_ref()[..8]);
     debug!("Writer task started for peer {}", peer_hex);
     let mut pkt_count = 0u64;
+    let mut last_send = tokio::time::Instant::now();
+    let pacing = tokio::time::Duration::from_millis(PACING_INTERVAL_MS);
     loop {
         tokio::select! {
             packet = outgoing.recv() => {
@@ -564,10 +566,20 @@ async fn writer_task(
                             debug!("Writer sending pkt #{} ({} bytes, flags=0x{:02x}, port={}, stream={}) to {}",
                                 pkt_count, data.len(), pkt.flags, pkt.port, pkt.stream_id, peer_hex);
                         }
+
+                        // Pace packets: ensure at least PACING_INTERVAL_MS
+                        // between consecutive sends to avoid overwhelming
+                        // ironwood's 25 ms queue budget.
+                        let elapsed = last_send.elapsed();
+                        if elapsed < pacing {
+                            tokio::time::sleep(pacing - elapsed).await;
+                        }
+
                         if let Err(e) = conn.write_to(&data, &peer).await {
                             error!("write_to failed for peer {}: {}", peer_hex, e);
                             return Err(e.into());
                         }
+                        last_send = tokio::time::Instant::now();
                     }
                     None => {
                         info!("Outgoing channel closed for peer {} (sent {} pkts)", peer_hex, pkt_count);
@@ -580,7 +592,6 @@ async fn writer_task(
                 return Ok(());
             }
         }
-        tokio::task::yield_now().await;
     }
 }
 

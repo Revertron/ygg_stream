@@ -46,6 +46,11 @@ pub const MAX_RTO_MS: u64 = 5_000;
 /// Maximum total stall time before giving up (30 seconds)
 pub const MAX_STALL_MS: u64 = 30_000;
 
+/// Minimum inter-packet interval in milliseconds (pacing).
+/// Ironwood drops packets queued longer than 25 ms, so spacing consecutive
+/// packets by at least 10 ms keeps the queue well under that budget.
+pub const PACING_INTERVAL_MS: u64 = 10;
+
 /// Protocol packet
 ///
 /// Wire format:
