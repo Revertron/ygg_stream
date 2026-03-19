@@ -252,7 +252,13 @@ impl Stream {
                     cwnd_val + (SEND_CHUNK_SIZE as u32 * SEND_CHUNK_SIZE as u32) / cwnd_val.max(1)
                 };
                 self.cwnd.store(new_cwnd.min(MAX_INFLIGHT as u32), Ordering::Release);
-            } else if new_ack == old_ack && old_ack > 0 {
+            } else if new_ack == old_ack && old_ack > 0 && packet.data.is_empty() {
+                // Only count dup-ACKs from standalone ACK packets (no data).
+                // Data packets carry a piggybacked ack_seq that may be stale
+                // simply because the sender is busy transmitting — not because
+                // our data was lost.  Counting those as dup-ACKs causes false
+                // fast-retransmits and cwnd collapse when a peer sends many
+                // requests in quick succession (e.g. 10 subscribes at once).
                 let count = self.dup_ack_count.fetch_add(1, Ordering::AcqRel) + 1;
                 if count == 3 {
                     // Multiplicative decrease on triple dup-ACK
