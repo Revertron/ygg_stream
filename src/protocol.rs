@@ -37,8 +37,18 @@ pub const MAX_INFLIGHT: usize = 512 * 1024;
 /// Initial congestion window (2 segments = 32 KB)
 pub const INITIAL_CWND: usize = 2 * SEND_CHUNK_SIZE;
 
-/// Retransmit timeout in milliseconds (initial RTO)
-pub const RETRANSMIT_TIMEOUT_MS: u64 = 150;
+/// Initial RTO in milliseconds before any RTT samples are available.
+/// 500 ms is a sane default for mesh networks where RTT is typically 200-500 ms+.
+pub const INITIAL_RTO_MS: u64 = 500;
+
+/// Minimum RTO floor in milliseconds.
+/// Mesh networks have higher latency than LAN; this prevents the computed
+/// RTO from being too aggressive even with very fast RTT samples.
+pub const MIN_RTO_MS: u64 = 200;
+
+/// Clock granularity for RTO calculation in milliseconds (RFC 6298 recommends >= 100 ms;
+/// we use 50 ms since tokio timers have sub-ms precision).
+pub const CLOCK_GRANULARITY_MS: u64 = 50;
 
 /// Maximum retransmit timeout in milliseconds (cap for exponential backoff)
 pub const MAX_RTO_MS: u64 = 5_000;

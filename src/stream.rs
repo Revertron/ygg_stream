@@ -1,10 +1,11 @@
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Packet, DEFAULT_WINDOW_SIZE, INITIAL_CWND, MAX_INFLIGHT, MAX_RTO_MS, MAX_STALL_MS,
-    RETRANSMIT_TIMEOUT_MS, SEND_CHUNK_SIZE,
+    Packet, CLOCK_GRANULARITY_MS, DEFAULT_WINDOW_SIZE, INITIAL_CWND, INITIAL_RTO_MS,
+    MAX_INFLIGHT, MAX_RTO_MS, MAX_STALL_MS, MIN_RTO_MS, SEND_CHUNK_SIZE,
 };
 use ironwood::Addr;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::time::Instant;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -28,10 +29,78 @@ pub enum StreamState {
     Closed,
 }
 
+/// Jacobson/Karels RTT estimator (RFC 6298) with Karn's algorithm.
+struct RttEstimator {
+    /// Smoothed RTT in microseconds, or None if no sample yet.
+    srtt_us: Option<u64>,
+    /// RTT variation in microseconds.
+    rttvar_us: u64,
+    /// Computed RTO in milliseconds.
+    rto_ms: u64,
+    /// Sequence numbers that have been retransmitted (Karn's algorithm:
+    /// don't update RTT estimates from retransmitted segments).
+    retransmitted_seqs: HashSet<u32>,
+}
+
+impl RttEstimator {
+    fn new() -> Self {
+        Self {
+            srtt_us: None,
+            rttvar_us: 0,
+            rto_ms: INITIAL_RTO_MS,
+            retransmitted_seqs: HashSet::new(),
+        }
+    }
+
+    /// Feed an RTT sample and recompute RTO (RFC 6298 Section 2).
+    fn update(&mut self, sample_us: u64) {
+        match self.srtt_us {
+            None => {
+                // First measurement: SRTT = R, RTTVAR = R/2
+                self.srtt_us = Some(sample_us);
+                self.rttvar_us = sample_us / 2;
+            }
+            Some(srtt) => {
+                // RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R|   (beta = 1/4)
+                let diff = if srtt > sample_us { srtt - sample_us } else { sample_us - srtt };
+                self.rttvar_us = (self.rttvar_us * 3 / 4) + (diff / 4);
+                // SRTT = (1 - alpha) * SRTT + alpha * R              (alpha = 1/8)
+                self.srtt_us = Some((srtt * 7 / 8) + (sample_us / 8));
+            }
+        }
+        // RTO = SRTT + max(G, 4 * RTTVAR)
+        let srtt_ms = self.srtt_us.unwrap() / 1000;
+        let rttvar_ms = self.rttvar_us / 1000;
+        let k_rttvar = (4 * rttvar_ms).max(CLOCK_GRANULARITY_MS);
+        self.rto_ms = (srtt_ms + k_rttvar).clamp(MIN_RTO_MS, MAX_RTO_MS);
+    }
+
+    /// Current RTO in milliseconds.
+    fn rto(&self) -> u64 {
+        self.rto_ms
+    }
+
+    /// Mark a seq as retransmitted (Karn's algorithm).
+    fn mark_retransmitted(&mut self, seq: u32) {
+        self.retransmitted_seqs.insert(seq);
+    }
+
+    /// Check if a seq was retransmitted (and remove the mark).
+    fn was_retransmitted(&mut self, seq: u32) -> bool {
+        self.retransmitted_seqs.remove(&seq)
+    }
+
+    /// Discard retransmit marks for segments fully ACKed below `ack_seq`.
+    fn clear_retransmitted_up_to(&mut self, ack_seq: u32) {
+        self.retransmitted_seqs.retain(|&seq| seq >= ack_seq);
+    }
+}
+
 /// A buffered, unacknowledged segment kept for potential retransmission
 struct UnackedSegment {
     seq: u32,
     data: Vec<u8>,
+    sent_at: Instant,
 }
 
 /// Individual bidirectional stream
@@ -100,6 +169,11 @@ pub struct Stream {
     /// Slow-start threshold in bytes. Once cwnd >= ssthresh, growth becomes linear.
     ssthresh: Arc<AtomicU32>,
 
+    /// RTT estimator (Jacobson/Karels, RFC 6298). Shared between handle_packet
+    /// (produces RTT samples on ACK) and retransmit_loop (reads computed RTO).
+    /// Uses std::sync::Mutex — never held across await points.
+    rtt: Arc<Mutex<RttEstimator>>,
+
     // --- Stored wakers (std::sync::Mutex — fast, no await, no spawned tasks) ---
     read_waker: Arc<Mutex<Option<Waker>>>,
     write_waker: Arc<Mutex<Option<Waker>>>,
@@ -128,6 +202,7 @@ impl Stream {
             last_dup_ack: Arc::new(AtomicU32::new(0)),
             cwnd: Arc::new(AtomicU32::new(INITIAL_CWND as u32)),
             ssthresh: Arc::new(AtomicU32::new(MAX_INFLIGHT as u32)),
+            rtt: Arc::new(Mutex::new(RttEstimator::new())),
             read_waker: Arc::new(Mutex::new(None)),
             write_waker: Arc::new(Mutex::new(None)),
             close_waker: Arc::new(Mutex::new(None)),
@@ -230,6 +305,10 @@ impl Stream {
             if new_ack > old_ack {
                 self.send_ack_seq.store(new_ack, Ordering::Release);
                 let mut unacked = self.unacked.lock().unwrap();
+                // Capture the oldest segment's timing before pruning (for RTT measurement)
+                let oldest_sample = unacked.front()
+                    .filter(|seg| seg.seq.wrapping_add(seg.data.len() as u32) <= new_ack)
+                    .map(|seg| (seg.seq, seg.sent_at));
                 while let Some(front) = unacked.front() {
                     let seg_end = front.seq.wrapping_add(front.data.len() as u32);
                     if seg_end <= new_ack {
@@ -238,6 +317,22 @@ impl Stream {
                         break;
                     }
                 }
+                drop(unacked); // release before taking rtt lock
+
+                // RTT sample (Karn's algorithm: skip retransmitted segments)
+                if let Some((seq, sent_at)) = oldest_sample {
+                    let mut rtt = self.rtt.lock().unwrap();
+                    if !rtt.was_retransmitted(seq) {
+                        let sample_us = sent_at.elapsed().as_micros() as u64;
+                        rtt.update(sample_us);
+                        trace!(
+                            "Stream {}: RTT sample {}us, new RTO={}ms",
+                            self.id, sample_us, rtt.rto()
+                        );
+                    }
+                    rtt.clear_retransmitted_up_to(new_ack);
+                }
+
                 self.dup_ack_count.store(0, Ordering::Release);
                 self.last_dup_ack.store(new_ack, Ordering::Release);
 
@@ -270,6 +365,7 @@ impl Stream {
                     let seg = self.unacked.lock().unwrap().front()
                         .map(|s| (s.seq, s.data.clone()));
                     if let Some((seq, data)) = seg {
+                        self.rtt.lock().unwrap().mark_retransmitted(seq);
                         let ack_seq = self.next_recv_seq.load(Ordering::Acquire);
                         let recv_window = self.recv_window.load(Ordering::Acquire) as usize;
                         let pkt = Packet::data_ack(
@@ -425,13 +521,12 @@ impl Stream {
 
     /// Background retransmit timer task.
     ///
-    /// Uses exponential backoff: RTO starts at RETRANSMIT_TIMEOUT_MS and
-    /// doubles on each consecutive stall, capped at MAX_RTO_MS.  Resets to
-    /// initial RTO when ACK progress is observed.  Gives up and closes the
-    /// stream after MAX_STALL_MS of total stall time with no ACK progress.
+    /// Uses the RTT-based RTO from the Jacobson/Karels estimator (RFC 6298).
+    /// Applies exponential backoff on consecutive stalls, capped at MAX_RTO_MS.
+    /// Gives up and closes the stream after MAX_STALL_MS of total stall time.
     async fn retransmit_loop(&self) {
         let mut last_ack: u32 = 0;
-        let mut rto_ms: u64 = RETRANSMIT_TIMEOUT_MS;
+        let mut rto_ms: u64 = INITIAL_RTO_MS;
         let mut total_stall_ms: u64 = 0;
         let mut cwnd_collapsed = false;
 
@@ -444,29 +539,19 @@ impl Stream {
 
             let current_ack = self.send_ack_seq.load(Ordering::Acquire);
             if current_ack > last_ack {
-                // ACK progress
+                // ACK progress — use the RTT-based RTO
                 last_ack = current_ack;
                 total_stall_ms = 0;
                 cwnd_collapsed = false;
-
-                let unacked_empty = self.unacked.lock().unwrap().is_empty();
-                if unacked_empty {
-                    // All data delivered — full reset
-                    rto_ms = RETRANSMIT_TIMEOUT_MS;
-                } else {
-                    // Partial progress (e.g. after fast retransmit) — halve RTO
-                    // gradually instead of snapping back to baseline, to avoid
-                    // hammering a lossy path at 150ms intervals.
-                    rto_ms = (rto_ms / 2).max(RETRANSMIT_TIMEOUT_MS);
-                }
+                rto_ms = self.rtt.lock().unwrap().rto();
                 continue;
             }
 
             // No ACK progress — check if there's anything to retransmit
             let unacked_empty = self.unacked.lock().unwrap().is_empty();
             if unacked_empty {
-                // Nothing in flight — reset backoff, wait for new data
-                rto_ms = RETRANSMIT_TIMEOUT_MS;
+                // Nothing in flight — use RTT-based RTO, wait for new data
+                rto_ms = self.rtt.lock().unwrap().rto();
                 total_stall_ms = 0;
                 cwnd_collapsed = false;
                 continue;
@@ -511,6 +596,14 @@ impl Stream {
                     .collect()
             };
 
+            // Mark retransmitted segments for Karn's algorithm
+            {
+                let mut rtt = self.rtt.lock().unwrap();
+                for &(seq, _) in &segments {
+                    rtt.mark_retransmitted(seq);
+                }
+            }
+
             let ack_seq = self.next_recv_seq.load(Ordering::Acquire);
             let recv_window = self.recv_window.load(Ordering::Acquire) as usize;
 
@@ -529,7 +622,7 @@ impl Stream {
                 let _ = self.outgoing.try_send(pkt);
             }
 
-            // Exponential backoff
+            // Exponential backoff (RFC 6298 Section 5.5)
             rto_ms = (rto_ms * 2).min(MAX_RTO_MS);
         }
     }
@@ -692,7 +785,7 @@ impl AsyncWrite for Stream {
                 this.unacked
                     .lock()
                     .unwrap()
-                    .push_back(UnackedSegment { seq, data });
+                    .push_back(UnackedSegment { seq, data, sent_at: Instant::now() });
                 Poll::Ready(Ok(to_send))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -932,8 +1025,8 @@ mod tests {
 
         {
             let mut unacked = stream.unacked.lock().unwrap();
-            unacked.push_back(UnackedSegment { seq: 0, data: vec![0u8; 5] });
-            unacked.push_back(UnackedSegment { seq: 5, data: vec![0u8; 5] });
+            unacked.push_back(UnackedSegment { seq: 0, data: vec![0u8; 5], sent_at: Instant::now() });
+            unacked.push_back(UnackedSegment { seq: 5, data: vec![0u8; 5], sent_at: Instant::now() });
         }
         stream.next_send_seq.store(10, Ordering::Release);
 
@@ -983,8 +1076,8 @@ mod tests {
         // First ACK: cwnd should grow by SEND_CHUNK_SIZE (slow start)
         {
             let mut unacked = stream.unacked.lock().unwrap();
-            unacked.push_back(UnackedSegment { seq: 0, data: vec![0u8; SEND_CHUNK_SIZE] });
-            unacked.push_back(UnackedSegment { seq: chunk, data: vec![0u8; SEND_CHUNK_SIZE] });
+            unacked.push_back(UnackedSegment { seq: 0, data: vec![0u8; SEND_CHUNK_SIZE], sent_at: Instant::now() });
+            unacked.push_back(UnackedSegment { seq: chunk, data: vec![0u8; SEND_CHUNK_SIZE], sent_at: Instant::now() });
         }
         let ack1 = Packet::ack(1, 1, chunk, DEFAULT_WINDOW_SIZE);
         stream.handle_packet(ack1).await.unwrap();
@@ -1021,6 +1114,7 @@ mod tests {
                 unacked.push_back(UnackedSegment {
                     seq: chunk * i,
                     data: vec![0u8; SEND_CHUNK_SIZE],
+                    sent_at: Instant::now(),
                 });
             }
         }
@@ -1080,5 +1174,152 @@ mod tests {
             chunk * 4,
             "ssthresh should be half of previous cwnd"
         );
+    }
+
+    // --- RTT estimator tests ---
+
+    #[test]
+    fn test_rtt_estimator_initial_state() {
+        let rtt = RttEstimator::new();
+        assert_eq!(rtt.rto(), INITIAL_RTO_MS);
+        assert!(rtt.srtt_us.is_none());
+    }
+
+    #[test]
+    fn test_rtt_estimator_first_sample() {
+        let mut rtt = RttEstimator::new();
+        // 300ms sample
+        rtt.update(300_000);
+        assert_eq!(rtt.srtt_us, Some(300_000));
+        assert_eq!(rtt.rttvar_us, 150_000); // R/2
+
+        // RTO = SRTT + max(G, 4*RTTVAR) = 300 + max(50, 600) = 900ms
+        assert_eq!(rtt.rto(), 900);
+    }
+
+    #[test]
+    fn test_rtt_estimator_multiple_samples() {
+        let mut rtt = RttEstimator::new();
+        // First: 300ms
+        rtt.update(300_000);
+        assert_eq!(rtt.rto(), 900);
+
+        // Second: 280ms — SRTT should converge, RTTVAR should shrink
+        rtt.update(280_000);
+        // RTTVAR = 3/4 * 150000 + 1/4 * |300000-280000| = 112500 + 5000 = 117500
+        assert_eq!(rtt.rttvar_us, 117500);
+        // SRTT = 7/8 * 300000 + 1/8 * 280000 = 262500 + 35000 = 297500
+        assert_eq!(rtt.srtt_us, Some(297500));
+
+        // RTO = 297 + max(50, 4*117) = 297 + 468 = 765
+        assert_eq!(rtt.rto(), 765);
+    }
+
+    #[test]
+    fn test_rtt_estimator_min_floor() {
+        let mut rtt = RttEstimator::new();
+        // Very fast: 1ms RTT
+        rtt.update(1_000);
+        // SRTT = 1ms, RTTVAR = 0.5ms
+        // RTO = 1 + max(50, 4*0) = 1 + 50 = 51 → clamped to MIN_RTO_MS = 200
+        assert_eq!(rtt.rto(), MIN_RTO_MS);
+    }
+
+    #[test]
+    fn test_rtt_estimator_max_cap() {
+        let mut rtt = RttEstimator::new();
+        // Extremely high: 10 seconds
+        rtt.update(10_000_000);
+        // RTO would be huge, capped at MAX_RTO_MS
+        assert_eq!(rtt.rto(), MAX_RTO_MS);
+    }
+
+    #[test]
+    fn test_karn_algorithm() {
+        let mut rtt = RttEstimator::new();
+        rtt.mark_retransmitted(0);
+        rtt.mark_retransmitted(100);
+
+        assert!(rtt.was_retransmitted(0));
+        // Second call returns false (removed on first check)
+        assert!(!rtt.was_retransmitted(0));
+        assert!(rtt.was_retransmitted(100));
+    }
+
+    #[test]
+    fn test_karn_clear_up_to() {
+        let mut rtt = RttEstimator::new();
+        rtt.mark_retransmitted(0);
+        rtt.mark_retransmitted(100);
+        rtt.mark_retransmitted(200);
+
+        rtt.clear_retransmitted_up_to(150);
+        // 0 and 100 should be cleared, 200 should remain
+        assert!(!rtt.was_retransmitted(0));
+        assert!(!rtt.was_retransmitted(100));
+        assert!(rtt.was_retransmitted(200));
+    }
+
+    #[tokio::test]
+    async fn test_rtt_sample_from_ack() {
+        let (tx, _rx) = mpsc::channel(32);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
+
+        let syn_ack = Packet::syn_ack(1, 1);
+        stream.handle_packet(syn_ack).await.unwrap();
+
+        // Simulate sending a segment
+        let sent_at = Instant::now();
+        {
+            let mut unacked = stream.unacked.lock().unwrap();
+            unacked.push_back(UnackedSegment {
+                seq: 0,
+                data: vec![0u8; 100],
+                sent_at,
+            });
+        }
+        stream.next_send_seq.store(100, Ordering::Release);
+
+        // Wait a bit so the RTT sample is measurable
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Send ACK that covers the segment
+        let ack = Packet::ack(1, 1, 100, DEFAULT_WINDOW_SIZE);
+        stream.handle_packet(ack).await.unwrap();
+
+        // RTT estimator should have a sample now
+        let rtt = stream.rtt.lock().unwrap();
+        assert!(rtt.srtt_us.is_some(), "RTT estimator should have a sample");
+        let srtt_ms = rtt.srtt_us.unwrap() / 1000;
+        assert!(srtt_ms >= 10, "SRTT should be at least 10ms, got {}ms", srtt_ms);
+    }
+
+    #[tokio::test]
+    async fn test_rtt_skips_retransmitted_segment() {
+        let (tx, _rx) = mpsc::channel(32);
+        let stream = Stream::new(1, 1, Addr::from([0u8; 32]), tx);
+
+        let syn_ack = Packet::syn_ack(1, 1);
+        stream.handle_packet(syn_ack).await.unwrap();
+
+        // Simulate a retransmitted segment
+        {
+            let mut unacked = stream.unacked.lock().unwrap();
+            unacked.push_back(UnackedSegment {
+                seq: 0,
+                data: vec![0u8; 100],
+                sent_at: Instant::now(),
+            });
+        }
+        stream.next_send_seq.store(100, Ordering::Release);
+        stream.rtt.lock().unwrap().mark_retransmitted(0);
+
+        // ACK it
+        let ack = Packet::ack(1, 1, 100, DEFAULT_WINDOW_SIZE);
+        stream.handle_packet(ack).await.unwrap();
+
+        // RTT estimator should NOT have a sample (Karn's algorithm)
+        let rtt = stream.rtt.lock().unwrap();
+        assert!(rtt.srtt_us.is_none(), "RTT should not be updated from retransmitted segment");
     }
 }
