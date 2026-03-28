@@ -1,127 +1,147 @@
-use crate::connection::Connection;
+use crate::connection::{ConnKey, TcpConnection, TcpState};
 use crate::error::{Error, Result};
-use crate::protocol::{Packet, MAX_DATA_SIZE, PACING_INTERVAL_MS};
-use crate::stream::Stream;
+use crate::protocol::{
+    Packet, MAX_DATA_SIZE, MAX_SYN_RETRIES, PACING_INTERVAL_MS,
+    SYN_INITIAL_RETRY_MS,
+};
 use ironwood::{Addr, EncryptedPacketConn, PacketConn};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-/// A per-port accept channel.
-///
-/// Created by [`StreamManager::listen`] or [`ConnectHandle::listen`].
-/// Call [`Listener::accept`] to receive incoming streams on this port.
-pub struct Listener {
+/// Start of ephemeral port range
+const EPHEMERAL_PORT_START: u16 = 49152;
+
+// ── TcpListener ────────────────────────────────────────────────────────────
+
+/// A per-port accept channel for incoming connections.
+pub struct TcpListener {
     port: u16,
-    rx: mpsc::Receiver<Arc<Stream>>,
+    rx: mpsc::Receiver<TcpConnection>,
 }
 
-impl Listener {
-    /// The port this listener is bound to.
+impl TcpListener {
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// Accept an incoming stream on this port.
-    pub async fn accept(&mut self) -> Result<Stream> {
-        self.rx
-            .recv()
-            .await
-            .map(|arc| (*arc).clone())
-            .ok_or(Error::ConnectionClosed)
+    /// Accept an incoming connection on this port.
+    pub async fn accept(&mut self) -> Result<TcpConnection> {
+        self.rx.recv().await.ok_or(Error::ConnectionClosed)
     }
 }
 
-/// A per-port datagram receiver.
-///
-/// Created by [`StreamManager::listen_datagram`] or [`ConnectHandle::listen_datagram`].
-/// Call [`DatagramListener::recv`] to receive incoming datagrams on this port.
+// ── DatagramListener ───────────────────────────────────────────────────────
+
+/// A per-port datagram receiver (connectionless).
 pub struct DatagramListener {
     port: u16,
     rx: mpsc::Receiver<(Vec<u8>, Addr)>,
 }
 
 impl DatagramListener {
-    /// The port this datagram listener is bound to.
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// Receive the next datagram on this port.
-    ///
-    /// Returns `(data, sender_addr)`.
     pub async fn recv(&mut self) -> Result<(Vec<u8>, Addr)> {
-        self.rx
-            .recv()
-            .await
-            .ok_or(Error::ConnectionClosed)
+        self.rx.recv().await.ok_or(Error::ConnectionClosed)
     }
 }
 
-/// StreamManager manages connections and stream multiplexing
+// ── TcpStack ───────────────────────────────────────────────────────────────
+
+/// The TCP/KEY protocol stack.
 ///
-/// Wraps an EncryptedPacketConn and provides stream-oriented API.
-pub struct StreamManager {
-    /// Underlying encrypted packet connection
+/// Owns the underlying EncryptedPacketConn, runs a single reader task and
+/// a single writer task. Manages connection table and port listeners.
+pub struct TcpStack {
     conn: Arc<EncryptedPacketConn>,
 
-    /// Active connections (peer address -> Connection)
-    connections: Arc<RwLock<HashMap<Addr, Arc<Connection>>>>,
+    /// Connection table: ConnKey → packet sender for that connection's background task
+    connections: Arc<RwLock<HashMap<ConnKey, mpsc::Sender<Packet>>>>,
 
-    /// Per-port listener senders
-    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>>,
+    /// Port listeners: port → sender for newly accepted connections
+    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<TcpConnection>>>>,
 
-    /// Per-port datagram listener senders
+    /// Datagram listeners
     datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>>,
 
-    /// Cancellation token for graceful shutdown
+    /// Sender for the central writer task
+    outgoing: mpsc::Sender<(Vec<u8>, Addr)>,
+
+    /// Ephemeral port allocator
+    next_ephemeral_port: AtomicU16,
+
     cancel: CancellationToken,
 }
 
-impl StreamManager {
-    /// Create a new stream manager
+impl TcpStack {
     pub fn new(conn: Arc<EncryptedPacketConn>) -> Self {
-        let listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>> =
+        let connections: Arc<RwLock<HashMap<ConnKey, mpsc::Sender<Packet>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<TcpConnection>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let cancel = CancellationToken::new();
 
-        let manager = Self {
-            conn: conn.clone(),
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            listeners: listeners.clone(),
-            datagram_listeners: datagram_listeners.clone(),
-            cancel: CancellationToken::new(),
-        };
+        // Spawn the central writer task
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(512);
+        {
+            let conn = conn.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                writer_task(conn, outgoing_rx, cancel).await;
+            });
+        }
 
-        // Spawn background reader task
-        let connections = manager.connections.clone();
-        let cancel = manager.cancel.clone();
-        tokio::spawn(async move {
-            if let Err(e) = reader_task(conn, connections, listeners, datagram_listeners, cancel).await {
-                error!("Reader task error: {}", e);
-            }
-        });
+        // Spawn the reader task
+        {
+            let conn = conn.clone();
+            let connections = connections.clone();
+            let listeners = listeners.clone();
+            let datagram_listeners = datagram_listeners.clone();
+            let outgoing_tx = outgoing_tx.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                if let Err(e) = reader_task(
+                    conn,
+                    connections,
+                    listeners,
+                    datagram_listeners,
+                    outgoing_tx,
+                    cancel,
+                )
+                .await
+                {
+                    error!("Reader task error: {}", e);
+                }
+            });
+        }
 
-        manager
+        Self {
+            conn,
+            connections,
+            listeners,
+            datagram_listeners,
+            outgoing: outgoing_tx,
+            next_ephemeral_port: AtomicU16::new(EPHEMERAL_PORT_START),
+            cancel,
+        }
     }
 
     /// Register a listener for the given port.
-    ///
-    /// Returns a [`Listener`] whose `accept()` yields incoming streams on that port.
-    /// Streams arriving on ports with no listener are RST'd back to the sender.
-    pub async fn listen(&self, port: u16) -> Listener {
+    pub async fn listen(&self, port: u16) -> TcpListener {
         let (tx, rx) = mpsc::channel(16);
         self.listeners.write().await.insert(port, tx);
-        Listener { port, rx }
+        TcpListener { port, rx }
     }
 
     /// Register a datagram listener for the given port.
-    ///
-    /// Returns a [`DatagramListener`] whose `recv()` yields incoming datagrams.
-    /// Datagrams arriving on ports with no listener are silently dropped.
     pub async fn listen_datagram(&self, port: u16) -> DatagramListener {
         let (tx, rx) = mpsc::channel(64);
         self.datagram_listeners.write().await.insert(port, tx);
@@ -129,9 +149,6 @@ impl StreamManager {
     }
 
     /// Send a connectionless datagram to a peer on the given port.
-    ///
-    /// Bypasses the Connection/Stream machinery entirely — no handshake,
-    /// no flow control, no ordering guarantees.
     pub async fn send_datagram(&self, peer: &Addr, port: u16, data: Vec<u8>) -> Result<()> {
         if data.len() > MAX_DATA_SIZE {
             return Err(Error::PacketTooLarge(data.len(), MAX_DATA_SIZE));
@@ -142,103 +159,149 @@ impl StreamManager {
         Ok(())
     }
 
-    /// Connect to a peer (or reuse existing connection)
-    pub async fn connect(&self, peer: Addr) -> Result<Arc<Connection>> {
-        // Check if connection already exists and is alive
-        {
-            let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&peer) {
-                if conn.is_alive() {
-                    debug!("Reusing existing connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
-                    return Ok(conn.clone());
-                }
-            }
-        }
-
-        // Remove stale connection if present
-        {
-            let mut connections = self.connections.write().await;
-            if let Some(old) = connections.remove(&peer) {
-                debug!("Removing stale connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
-                old.close().await;
-            }
-        }
-
-        // Create new connection as initiator
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
-        let connection = Arc::new(Connection::new_initiator(peer, outgoing_tx));
-
-        // Register connection
-        {
-            let mut connections = self.connections.write().await;
-            connections.insert(peer, connection.clone());
-        }
-
-        // Spawn writer task for this connection.
-        // When the writer task exits, mark the connection dead.
-        let conn = self.conn.clone();
-        let cancel = self.cancel.clone();
-        let conn_ref = connection.clone();
-        tokio::spawn(async move {
-            if let Err(e) = writer_task(conn, peer, outgoing_rx, cancel).await {
-                error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-            }
-            conn_ref.mark_dead().await;
-        });
-
-        debug!("Created new connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
-
-        Ok(connection)
+    /// Connect to a remote peer on the given port. Auto-assigns ephemeral local port.
+    pub async fn connect(&self, remote_key: Addr, remote_port: u16) -> Result<TcpConnection> {
+        let local_port = self.allocate_ephemeral_port();
+        self.connect_from(local_port, remote_key, remote_port).await
     }
 
-    /// Close all connections and shut down
-    pub async fn close(&self) {
-        self.cancel.cancel();
-
-        // Close all connections
-        let connections = {
-            let mut connections_lock = self.connections.write().await;
-            let current_connections: Vec<_> = connections_lock.values().cloned().collect();
-            connections_lock.clear();
-            current_connections
+    /// Connect with an explicit local port.
+    pub async fn connect_from(
+        &self,
+        local_port: u16,
+        remote_key: Addr,
+        remote_port: u16,
+    ) -> Result<TcpConnection> {
+        let key = ConnKey {
+            local_port,
+            remote_key,
+            remote_port,
         };
 
-        for conn in connections {
-            conn.close().await;
+        // Check for existing connection
+        {
+            let conns = self.connections.read().await;
+            if conns.contains_key(&key) {
+                return Err(Error::ConnectionExists(local_port, remote_port));
+            }
         }
 
-        debug!("StreamManager closed");
+        // Create connection in SynSent state
+        let (incoming_tx, incoming_rx) = mpsc::channel(64);
+        let conn = TcpConnection::new(key, TcpState::SynSent, self.outgoing.clone(), self.cancel.clone());
+
+        // Register in connection table
+        self.connections.write().await.insert(key, incoming_tx);
+
+        // Spawn background task
+        conn.spawn_background_task(incoming_rx);
+
+        // Send SYN with exponential backoff
+        let start = tokio::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        let mut syn_count = 0u32;
+        let mut retry_interval_ms = SYN_INITIAL_RETRY_MS;
+
+        let result = loop {
+            if syn_count >= MAX_SYN_RETRIES {
+                warn!(
+                    "connect gave up after {} SYN attempts for {:?}",
+                    syn_count, key
+                );
+                break Err(Error::Timeout);
+            }
+
+            match conn.send_syn().await {
+                Ok(()) => {
+                    syn_count += 1;
+                    info!("Sent SYN #{} for {:?} (retry in {}ms)", syn_count, key, retry_interval_ms);
+                }
+                Err(e) => break Err(e),
+            }
+
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break Err(Error::Timeout);
+            }
+
+            let wait_time = std::cmp::min(
+                std::time::Duration::from_millis(retry_interval_ms),
+                remaining,
+            );
+
+            tokio::select! {
+                _ = conn.wait_for_open() => {
+                    info!("Connection {:?} established after {} SYNs", key, syn_count);
+                    break Ok(conn.clone());
+                }
+                _ = tokio::time::sleep(wait_time) => {}
+                _ = self.cancel.cancelled() => {
+                    break Err(Error::ConnectionClosed);
+                }
+            }
+
+            retry_interval_ms *= 2;
+        };
+
+        if result.is_err() {
+            self.connections.write().await.remove(&key);
+        }
+
+        result
     }
 
-    /// Get the number of active connections
+    fn allocate_ephemeral_port(&self) -> u16 {
+        let port = self.next_ephemeral_port.fetch_add(1, Ordering::Relaxed);
+        if port == 0 {
+            // Wrapped around — skip 0 and restart from EPHEMERAL_PORT_START
+            self.next_ephemeral_port.store(EPHEMERAL_PORT_START + 1, Ordering::Relaxed);
+            EPHEMERAL_PORT_START
+        } else {
+            port
+        }
+    }
+
+    /// Close all connections and shut down.
+    pub async fn close(&self) {
+        self.cancel.cancel();
+        let mut conns = self.connections.write().await;
+        conns.clear();
+        self.listeners.write().await.clear();
+        self.datagram_listeners.write().await.clear();
+        debug!("TcpStack closed");
+    }
+
     pub async fn connection_count(&self) -> usize {
         self.connections.read().await.len()
     }
 
-    /// Get the local node address
     pub fn local_addr(&self) -> Addr {
         self.conn.local_addr()
     }
 
-    /// Split into a shareable connect handle and move listener state out.
-    ///
-    /// Use this when you need concurrent connect and listen without shared locking:
-    /// - Give `ConnectHandle` to any code that needs to open streams.
-    /// - Call `ConnectHandle::listen(port)` to register per-port accept channels.
-    ///
-    /// After calling `split()`, methods on the original manager should not be used.
+    /// Remove a connection from the table (called when connection reaches Closed)
+    #[allow(dead_code)]
+    pub(crate) async fn remove_connection(&self, key: &ConnKey) {
+        self.connections.write().await.remove(key);
+    }
+
+    /// Split into a cloneable ConnectHandle. After this, use the handle.
     pub fn split(self) -> ConnectHandle {
         let handle = ConnectHandle {
             conn: self.conn.clone(),
             connections: self.connections.clone(),
             listeners: self.listeners.clone(),
             datagram_listeners: self.datagram_listeners.clone(),
+            outgoing: self.outgoing.clone(),
+            next_ephemeral_port: Arc::new(AtomicU16::new(
+                self.next_ephemeral_port.load(Ordering::Relaxed),
+            )),
             cancel: self.cancel.clone(),
         };
 
-        // Keep the manager alive (its reader_task still runs).
+        // Keep the stack alive (reader/writer tasks)
         tokio::spawn(async move {
-            let _manager = self; // keeps reader_task alive
+            let _stack = self;
             std::future::pending::<()>().await;
         });
 
@@ -246,84 +309,116 @@ impl StreamManager {
     }
 }
 
-/// A cloneable handle for opening new connections and registering listeners.
-///
-/// All fields are `Arc`-wrapped, so cloning is cheap and safe for concurrent use.
+impl Drop for TcpStack {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+// ── ConnectHandle ──────────────────────────────────────────────────────────
+
+/// A cloneable handle for connecting and listening.
 #[derive(Clone)]
 pub struct ConnectHandle {
     conn: Arc<EncryptedPacketConn>,
-    connections: Arc<RwLock<HashMap<Addr, Arc<Connection>>>>,
-    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>>,
+    connections: Arc<RwLock<HashMap<ConnKey, mpsc::Sender<Packet>>>>,
+    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<TcpConnection>>>>,
     datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>>,
+    outgoing: mpsc::Sender<(Vec<u8>, Addr)>,
+    next_ephemeral_port: Arc<AtomicU16>,
     cancel: CancellationToken,
 }
 
 impl ConnectHandle {
-    /// Connect to a peer (or reuse existing connection).
-    pub async fn connect(&self, peer: Addr) -> Result<Arc<Connection>> {
-        // Check if connection already exists and is alive
+    /// Connect to a remote peer on the given port.
+    pub async fn connect(&self, remote_key: Addr, remote_port: u16) -> Result<TcpConnection> {
+        let local_port = self.allocate_ephemeral_port();
+        self.connect_from(local_port, remote_key, remote_port).await
+    }
+
+    pub async fn connect_from(
+        &self,
+        local_port: u16,
+        remote_key: Addr,
+        remote_port: u16,
+    ) -> Result<TcpConnection> {
+        let key = ConnKey {
+            local_port,
+            remote_key,
+            remote_port,
+        };
+
         {
-            let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&peer) {
-                if conn.is_alive() {
-                    debug!("Reusing existing connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
-                    return Ok(conn.clone());
+            let conns = self.connections.read().await;
+            if conns.contains_key(&key) {
+                return Err(Error::ConnectionExists(local_port, remote_port));
+            }
+        }
+
+        let (incoming_tx, incoming_rx) = mpsc::channel(64);
+        let conn = TcpConnection::new(key, TcpState::SynSent, self.outgoing.clone(), self.cancel.clone());
+
+        self.connections.write().await.insert(key, incoming_tx);
+        conn.spawn_background_task(incoming_rx);
+
+        // SYN with exponential backoff
+        let start = tokio::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        let mut syn_count = 0u32;
+        let mut retry_interval_ms = SYN_INITIAL_RETRY_MS;
+
+        let result = loop {
+            if syn_count >= MAX_SYN_RETRIES {
+                break Err(Error::Timeout);
+            }
+
+            match conn.send_syn().await {
+                Ok(()) => syn_count += 1,
+                Err(e) => break Err(e),
+            }
+
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break Err(Error::Timeout);
+            }
+
+            let wait_time = std::cmp::min(
+                std::time::Duration::from_millis(retry_interval_ms),
+                remaining,
+            );
+
+            tokio::select! {
+                _ = conn.wait_for_open() => {
+                    break Ok(conn.clone());
+                }
+                _ = tokio::time::sleep(wait_time) => {}
+                _ = self.cancel.cancelled() => {
+                    break Err(Error::ConnectionClosed);
                 }
             }
+
+            retry_interval_ms *= 2;
+        };
+
+        if result.is_err() {
+            self.connections.write().await.remove(&key);
         }
 
-        // Remove stale connection if present
-        {
-            let mut connections = self.connections.write().await;
-            if let Some(old) = connections.remove(&peer) {
-                debug!("Removing stale connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
-                old.close().await;
-            }
-        }
-
-        // Create new connection as initiator
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
-        let connection = Arc::new(Connection::new_initiator(peer, outgoing_tx));
-
-        // Register connection
-        {
-            let mut connections = self.connections.write().await;
-            connections.insert(peer, connection.clone());
-        }
-
-        // Spawn writer task for this connection.
-        // When the writer task exits (error or channel close), cancel the
-        // connection so that `is_alive()` returns false and future connect
-        // calls create a fresh connection instead of reusing a dead one.
-        let conn = self.conn.clone();
-        let cancel = self.cancel.clone();
-        let conn_ref = connection.clone();
-        tokio::spawn(async move {
-            if let Err(e) = writer_task(conn, peer, outgoing_rx, cancel).await {
-                error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-            }
-            conn_ref.mark_dead().await;
-        });
-
-        debug!("Created new connection to peer {:?}", hex::encode(&peer.as_ref()[..8]));
-        Ok(connection)
+        result
     }
 
-    /// Register a listener for the given port.
-    pub async fn listen(&self, port: u16) -> Listener {
+    pub async fn listen(&self, port: u16) -> TcpListener {
         let (tx, rx) = mpsc::channel(16);
         self.listeners.write().await.insert(port, tx);
-        Listener { port, rx }
+        TcpListener { port, rx }
     }
 
-    /// Register a datagram listener for the given port.
     pub async fn listen_datagram(&self, port: u16) -> DatagramListener {
         let (tx, rx) = mpsc::channel(64);
         self.datagram_listeners.write().await.insert(port, tx);
         DatagramListener { port, rx }
     }
 
-    /// Send a connectionless datagram to a peer on the given port.
     pub async fn send_datagram(&self, peer: &Addr, port: u16, data: Vec<u8>) -> Result<()> {
         if data.len() > MAX_DATA_SIZE {
             return Err(Error::PacketTooLarge(data.len(), MAX_DATA_SIZE));
@@ -334,54 +429,42 @@ impl ConnectHandle {
         Ok(())
     }
 
-    /// Get the local node address.
     pub fn local_addr(&self) -> Addr {
         self.conn.local_addr()
     }
 
-    /// Force-close and remove a cached connection to a peer.
-    pub async fn close_connection(&self, addr: Addr) {
-        let conn = {
-            let mut guard = self.connections.write().await;
-            guard.remove(&addr)
-        };
-        if let Some(c) = conn {
-            c.close().await;
-        }
+    /// Force-close and remove a connection to a peer.
+    pub async fn close_connection(&self, key: ConnKey) {
+        self.connections.write().await.remove(&key);
     }
 
-    /// Shut down all connections and clear all listener maps.
-    ///
-    /// Cancels the reader/writer tasks, closes every cached connection (freeing
-    /// their stream buffers), and drops listener channel senders.
+    /// Shut down all connections and listeners.
     pub async fn close_all(&self) {
         self.cancel.cancel();
-
-        // Close and remove all cached connections.
-        let conns: Vec<_> = {
-            let mut guard = self.connections.write().await;
-            guard.drain().map(|(_, c)| c).collect()
-        };
-        for c in conns {
-            c.close().await;
-        }
-
-        // Drop listener senders so receiver sides see channel-closed.
+        self.connections.write().await.clear();
         self.listeners.write().await.clear();
         self.datagram_listeners.write().await.clear();
     }
+
+    fn allocate_ephemeral_port(&self) -> u16 {
+        let port = self.next_ephemeral_port.fetch_add(1, Ordering::Relaxed);
+        if port == 0 {
+            self.next_ephemeral_port.store(EPHEMERAL_PORT_START + 1, Ordering::Relaxed);
+            EPHEMERAL_PORT_START
+        } else {
+            port
+        }
+    }
 }
 
-/// Background reader task
-///
-/// Continuously reads packets from the underlying connection and routes them
-/// to the appropriate Connection. For new incoming SYN packets, looks up the
-/// port listener and sends an RST if no listener is registered.
+// ── Reader task ────────────────────────────────────────────────────────────
+
 async fn reader_task(
     conn: Arc<EncryptedPacketConn>,
-    connections: Arc<RwLock<HashMap<Addr, Arc<Connection>>>>,
-    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<Arc<Stream>>>>>,
+    connections: Arc<RwLock<HashMap<ConnKey, mpsc::Sender<Packet>>>>,
+    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<TcpConnection>>>>,
     datagram_listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<(Vec<u8>, Addr)>>>>,
+    outgoing: mpsc::Sender<(Vec<u8>, Addr)>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
@@ -389,147 +472,115 @@ async fn reader_task(
     loop {
         tokio::select! {
             result = conn.read_from(&mut buf) => {
-                let (n, peer) = result?;
-                trace!("Received {} bytes from peer {}", n, hex::encode(&peer.as_ref()[..8]));
+                let (n, remote_key) = result?;
+                trace!("Received {} bytes from {}", n, hex::encode(&remote_key.as_ref()[..8]));
 
-                // Decode packet
                 let packet = match Packet::decode(&buf[..n]) {
                     Ok(p) => p,
                     Err(e) => {
-                        debug!("Failed to decode packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
+                        debug!("Decode error from {}: {}", hex::encode(&remote_key.as_ref()[..8]), e);
                         continue;
                     }
                 };
 
-                // Handle datagrams — bypass all stream/connection routing
+                // Datagrams — bypass connection table
                 if packet.is_dgram() {
-                    let dg_listeners = datagram_listeners.read().await;
-                    if let Some(tx) = dg_listeners.get(&packet.port) {
-                        let _ = tx.try_send((packet.data, peer));
-                    } else {
-                        trace!("No datagram listener for port {}, dropping", packet.port);
+                    let dg = datagram_listeners.read().await;
+                    if let Some(tx) = dg.get(&packet.dst_port) {
+                        let _ = tx.try_send((packet.data, remote_key));
                     }
                     continue;
                 }
 
-                let port = packet.port;
-
-                // Route to connection
-                let connection = {
-                    let conns = connections.read().await;
-                    conns.get(&peer).cloned()
+                let key = ConnKey {
+                    local_port: packet.dst_port,
+                    remote_key,
+                    remote_port: packet.src_port,
                 };
 
-                if let Some(conn_arc) = connection {
-                    let is_new_syn = packet.is_syn() && !packet.is_ack();
+                // Try to route to existing connection
+                let sender = {
+                    let conns = connections.read().await;
+                    conns.get(&key).cloned()
+                };
 
-                    // If it's a new SYN, check listener first
-                    if is_new_syn {
-                        let has_listener = listeners.read().await.contains_key(&port);
-                        if !has_listener {
-                            // No listener for this port — send RST
-                            warn!("No listener for port {} from peer {:?}, sending RST", port, hex::encode(&peer.as_ref()[..8]));
-                            let rst = Packet::rst(port, packet.stream_id);
-                            let rst_data = match rst.encode() {
-                                Ok(d) => d,
-                                Err(_) => continue,
-                            };
-                            let _ = conn.write_to(&rst_data, &peer).await;
-                            continue;
+                if let Some(tx) = sender {
+                    let _ = tx.send(packet).await;
+                    continue;
+                }
+
+                // No existing connection — handle SYN for new connections
+                if packet.is_syn() && !packet.is_ack() {
+                    let dst_port = packet.dst_port;
+
+                    // Check listener
+                    let has_listener = listeners.read().await.contains_key(&dst_port);
+                    if !has_listener {
+                        warn!("No listener for port {} from {}", dst_port, hex::encode(&remote_key.as_ref()[..8]));
+                        let rst = Packet::rst(dst_port, packet.src_port);
+                        if let Ok(data) = rst.encode() {
+                            let _ = outgoing.try_send((data, remote_key));
                         }
+                        continue;
                     }
 
-                    match conn_arc.handle_packet(packet).await {
-                        Err(e) => {
-                            warn!("Error handling packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-                        }
-                        Ok(true) if is_new_syn => {
-                            // New stream was created — pull it from the connection's
-                            // internal channel and forward to the port listener.
-                            if let Ok(stream) = conn_arc.accept_stream().await {
-                                let listeners_guard = listeners.read().await;
-                                if let Some(tx) = listeners_guard.get(&port) {
-                                    let stream_arc = Arc::new(stream);
-                                    if tx.send(stream_arc).await.is_err() {
-                                        warn!("Listener channel closed for port {}", port);
+                    // Create new connection in SynReceived state
+                    let (incoming_tx, incoming_rx) = mpsc::channel(64);
+                    let new_conn = TcpConnection::new(
+                        key,
+                        TcpState::SynReceived,
+                        outgoing.clone(),
+                        cancel.clone(),
+                    );
+
+                    // Set peer's window from SYN
+                    new_conn.set_peer_window(packet.window);
+
+                    // Register in connections table
+                    connections.write().await.insert(key, incoming_tx);
+
+                    // Spawn background task
+                    new_conn.spawn_background_task(incoming_rx);
+
+                    // Send SYN-ACK
+                    if let Err(e) = new_conn.send_syn_ack().await {
+                        warn!("Failed to send SYN-ACK: {}", e);
+                        connections.write().await.remove(&key);
+                        continue;
+                    }
+
+                    debug!(
+                        "New connection {:?} from {}, sent SYN-ACK",
+                        key, hex::encode(&remote_key.as_ref()[..8])
+                    );
+
+                    // Wait for handshake completion in background, then deliver to listener
+                    let listeners_ref = listeners.clone();
+                    let connections_ref = connections.clone();
+                    let conn_clone = new_conn.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = conn_clone.wait_for_open() => {
+                                let listeners_guard = listeners_ref.read().await;
+                                if let Some(tx) = listeners_guard.get(&dst_port) {
+                                    if tx.send(conn_clone).await.is_err() {
+                                        warn!("Listener channel closed for port {}", dst_port);
                                     }
                                 }
                             }
-                        }
-                        Ok(false) if is_new_syn => {
-                            // Duplicate SYN retransmission — SYN-ACK was resent
-                            // by handle_packet, no new stream to accept.
-                            debug!("Duplicate SYN from peer {:?} port={}, SYN-ACK resent", hex::encode(&peer.as_ref()[..8]), port);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // New incoming connection
-                    if packet.is_syn() && !packet.is_ack() {
-                        // Check if there's a listener for this port
-                        let has_listener = listeners.read().await.contains_key(&port);
-                        if !has_listener {
-                            warn!("No listener for port {} from new peer {:?}, sending RST", port, hex::encode(&peer.as_ref()[..8]));
-                            let rst = Packet::rst(port, packet.stream_id);
-                            let rst_data = match rst.encode() {
-                                Ok(d) => d,
-                                Err(_) => continue,
-                            };
-                            let _ = conn.write_to(&rst_data, &peer).await;
-                            continue;
-                        }
-
-                        debug!("New incoming connection from peer {:?}", hex::encode(&peer.as_ref()[..8]));
-
-                        // Create connection as acceptor
-                        let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
-                        let connection = Arc::new(Connection::new_acceptor(peer, outgoing_tx));
-
-                        // Register connection
-                        {
-                            let mut conns = connections.write().await;
-                            conns.insert(peer, connection.clone());
-                        }
-
-                        // Spawn writer task — mark connection dead on exit
-                        let conn_clone = conn.clone();
-                        let cancel_clone = cancel.clone();
-                        let conn_ref = connection.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = writer_task(conn_clone, peer, outgoing_rx, cancel_clone).await {
-                                error!("Writer task error for peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-                            }
-                            conn_ref.mark_dead().await;
-                        });
-
-                        // Handle the SYN packet (creates stream, sends SYN-ACK)
-                        match connection.handle_packet(packet).await {
-                            Err(e) => {
-                                warn!("Error handling SYN packet from peer {:?}: {}", hex::encode(&peer.as_ref()[..8]), e);
-                                continue;
-                            }
-                            Ok(false) => {
-                                // Duplicate SYN on a brand-new connection — shouldn't
-                                // happen, but handle gracefully.
-                                debug!("Duplicate SYN on new connection from {:?}", hex::encode(&peer.as_ref()[..8]));
-                                continue;
-                            }
-                            Ok(true) => {}
-                        }
-
-                        // Route the accepted stream to the port listener
-                        // The stream was just accepted — fetch it from the connection
-                        if let Ok(stream) = connection.accept_stream().await {
-                            let listeners_guard = listeners.read().await;
-                            if let Some(tx) = listeners_guard.get(&port) {
-                                let stream_arc = Arc::new(stream);
-                                if tx.send(stream_arc).await.is_err() {
-                                    warn!("Listener channel closed for port {}", port);
-                                }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                                // Handshake timeout
+                                warn!("SynReceived timeout for {:?}", key);
+                                let _ = conn_clone.abort().await;
+                                connections_ref.write().await.remove(&key);
                             }
                         }
-                    } else {
-                        trace!("Received packet from unknown peer {:?}, ignoring", hex::encode(&peer.as_ref()[..8]));
+                    });
+                } else if !packet.is_rst() {
+                    // Unknown connection, not a SYN — send RST
+                    let rst = Packet::rst(packet.dst_port, packet.src_port);
+                    if let Ok(data) = rst.encode() {
+                        let _ = outgoing.try_send((data, remote_key));
                     }
                 }
             }
@@ -541,63 +592,47 @@ async fn reader_task(
     }
 }
 
-/// Background writer task per connection
-///
-/// Aggregates packets from a connection's streams and writes them to the network.
+// ── Writer task (single, global) ───────────────────────────────────────────
+
 async fn writer_task(
     conn: Arc<EncryptedPacketConn>,
-    peer: Addr,
-    mut outgoing: mpsc::Receiver<Packet>,
+    mut outgoing: mpsc::Receiver<(Vec<u8>, Addr)>,
     cancel: CancellationToken,
-) -> Result<()> {
-    let peer_hex = hex::encode(&peer.as_ref()[..8]);
-    debug!("Writer task started for peer {}", peer_hex);
+) {
     let mut pkt_count = 0u64;
     let mut last_send = tokio::time::Instant::now();
     let pacing = tokio::time::Duration::from_millis(PACING_INTERVAL_MS);
+
     loop {
         tokio::select! {
-            packet = outgoing.recv() => {
-                match packet {
-                    Some(pkt) => {
-                        let data = pkt.encode()?;
+            item = outgoing.recv() => {
+                match item {
+                    Some((data, peer)) => {
                         pkt_count += 1;
-                        if pkt_count <= 5 || pkt.is_syn() {
-                            debug!("Writer sending pkt #{} ({} bytes, flags=0x{:02x}, port={}, stream={}) to {}",
-                                pkt_count, data.len(), pkt.flags, pkt.port, pkt.stream_id, peer_hex);
-                        }
 
-                        // Pace packets: ensure at least PACING_INTERVAL_MS
-                        // between consecutive sends to avoid overwhelming
-                        // ironwood's 25 ms queue budget.
+                        // Pacing
                         let elapsed = last_send.elapsed();
                         if elapsed < pacing {
                             tokio::time::sleep(pacing - elapsed).await;
                         }
 
                         if let Err(e) = conn.write_to(&data, &peer).await {
-                            error!("write_to failed for peer {}: {}", peer_hex, e);
-                            return Err(e.into());
+                            error!("write_to failed: {}", e);
+                            return;
                         }
                         last_send = tokio::time::Instant::now();
                     }
                     None => {
-                        info!("Outgoing channel closed for peer {} (sent {} pkts)", peer_hex, pkt_count);
-                        return Ok(());
+                        info!("Writer task: channel closed (sent {} pkts)", pkt_count);
+                        return;
                     }
                 }
             }
             _ = cancel.cancelled() => {
-                info!("Writer task cancelled for peer {} (sent {} pkts)", peer_hex, pkt_count);
-                return Ok(());
+                info!("Writer task cancelled (sent {} pkts)", pkt_count);
+                return;
             }
         }
-    }
-}
-
-impl Drop for StreamManager {
-    fn drop(&mut self) {
-        self.cancel.cancel();
     }
 }
 
@@ -608,207 +643,85 @@ mod tests {
     use ironwood::new_encrypted_packet_conn;
 
     #[tokio::test]
-    async fn test_manager_creation() {
+    async fn test_stack_creation() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-
-        assert_eq!(manager.connection_count().await, 0);
+        let stack = TcpStack::new(conn);
+        assert_eq!(stack.connection_count().await, 0);
     }
 
     #[tokio::test]
-    async fn test_manager_local_addr() {
+    async fn test_stack_local_addr() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let conn = new_encrypted_packet_conn(signing_key, Default::default());
         let local_addr = conn.local_addr();
-
-        let manager = StreamManager::new(conn);
-        assert_eq!(manager.local_addr(), local_addr);
+        let stack = TcpStack::new(conn);
+        assert_eq!(stack.local_addr(), local_addr);
     }
 
     #[tokio::test]
-    async fn test_manager_listen() {
+    async fn test_listen() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-
-        let listener = manager.listen(42).await;
+        let stack = TcpStack::new(conn);
+        let listener = stack.listen(42).await;
         assert_eq!(listener.port(), 42);
-
-        // Verify the listener is registered
-        assert!(manager.listeners.read().await.contains_key(&42));
+        assert!(stack.listeners.read().await.contains_key(&42));
     }
 
     #[tokio::test]
-    async fn test_manager_listen_datagram() {
+    async fn test_listen_datagram() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-
-        let dg_listener = manager.listen_datagram(99).await;
-        assert_eq!(dg_listener.port(), 99);
-
-        // Verify the datagram listener is registered
-        assert!(manager.datagram_listeners.read().await.contains_key(&99));
+        let stack = TcpStack::new(conn);
+        let dg = stack.listen_datagram(99).await;
+        assert_eq!(dg.port(), 99);
+        assert!(stack.datagram_listeners.read().await.contains_key(&99));
     }
 
-    /// Simulate the full datagram pipeline:
-    /// encode → decode → route → deliver
-    /// This is the same path the reader_task takes on every incoming packet.
     #[tokio::test]
-    async fn test_datagram_encode_decode_route_deliver() {
+    async fn test_datagram_pipeline() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
+        let stack = TcpStack::new(conn);
 
-        let payload = b"hello datagram world";
+        let payload = b"hello datagram";
         let sender = Addr::from([0xAB_u8; 32]);
         let port = 42u16;
 
-        // Register listener
-        let mut listener = manager.listen_datagram(port).await;
+        let mut listener = stack.listen_datagram(port).await;
 
-        // Simulate what the sender does: build and encode a datagram packet
+        // Simulate encode → decode → route
         let pkt = Packet::datagram(port, payload.to_vec());
         let encoded = pkt.encode().unwrap();
-
-        // Simulate what the reader_task does: decode and route
         let decoded = Packet::decode(&encoded).unwrap();
-        assert!(decoded.is_dgram(), "packet must be identified as datagram");
-        assert_eq!(decoded.port, port);
-        assert_eq!(decoded.seq, 0, "seq must be 0 for datagrams");
-        assert_eq!(decoded.ack_seq, 0, "ack_seq must be 0 for datagrams");
-        assert_eq!(decoded.data, payload);
+        assert!(decoded.is_dgram());
+        assert_eq!(decoded.dst_port, port);
 
-        // Route: push into the listener channel exactly as reader_task does
+        // Route into listener
         {
-            let dg_listeners = manager.datagram_listeners.read().await;
-            let tx = dg_listeners.get(&port).unwrap();
+            let dg = stack.datagram_listeners.read().await;
+            let tx = dg.get(&port).unwrap();
             tx.try_send((decoded.data, sender)).unwrap();
         }
 
-        // Deliver: application receives (data, sender_addr)
-        let (received_data, received_addr) = listener.recv().await.unwrap();
-        assert_eq!(received_data, payload);
-        assert_eq!(received_addr, sender);
+        let (data, addr) = listener.recv().await.unwrap();
+        assert_eq!(data, payload);
+        assert_eq!(addr, sender);
     }
 
     #[tokio::test]
-    async fn test_connect_removes_stale_connection() {
+    async fn test_ephemeral_port_allocation() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
+        let stack = TcpStack::new(conn);
 
-        let peer = Addr::from([42u8; 32]);
+        let p1 = stack.allocate_ephemeral_port();
+        let p2 = stack.allocate_ephemeral_port();
+        let p3 = stack.allocate_ephemeral_port();
 
-        // Manually insert a dead connection
-        let (tx, _rx) = mpsc::channel(256);
-        let dead_conn = Arc::new(Connection::new_initiator(peer, tx));
-        dead_conn.mark_dead().await;
-        assert!(!dead_conn.is_alive());
-        {
-            let mut conns = manager.connections.write().await;
-            conns.insert(peer, dead_conn.clone());
-        }
-        assert_eq!(manager.connection_count().await, 1);
-
-        // connect() should detect the stale connection, remove it, and create a new one
-        let new_conn = manager.connect(peer).await.unwrap();
-        assert!(new_conn.is_alive());
-        assert_eq!(manager.connection_count().await, 1);
-        // The new connection should be a different Arc (not the dead one)
-        assert!(new_conn.is_alive());
-    }
-
-    #[tokio::test]
-    async fn test_connect_reuses_alive_connection() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-
-        let peer = Addr::from([7u8; 32]);
-
-        // First connect creates a new connection
-        let conn1 = manager.connect(peer).await.unwrap();
-        assert!(conn1.is_alive());
-        assert_eq!(manager.connection_count().await, 1);
-
-        // Second connect reuses it
-        let conn2 = manager.connect(peer).await.unwrap();
-        assert_eq!(manager.connection_count().await, 1);
-        // Both should be the same Arc
-        assert!(Arc::ptr_eq(&conn1, &conn2));
-    }
-
-    #[tokio::test]
-    async fn test_connect_handle_removes_stale_connection() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-        let handle = manager.split();
-
-        let peer = Addr::from([99u8; 32]);
-
-        // Manually insert a dead connection via the shared map
-        let (tx, _rx) = mpsc::channel(256);
-        let dead_conn = Arc::new(Connection::new_initiator(peer, tx));
-        dead_conn.mark_dead().await;
-        {
-            let mut conns = handle.connections.write().await;
-            conns.insert(peer, dead_conn);
-        }
-
-        // connect() should remove it and create a fresh one
-        let new_conn = handle.connect(peer).await.unwrap();
-        assert!(new_conn.is_alive());
-    }
-
-    #[tokio::test]
-    async fn test_connect_handle_close_connection() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-        let handle = manager.split();
-
-        let peer = Addr::from([55u8; 32]);
-
-        let connection = handle.connect(peer).await.unwrap();
-        assert!(connection.is_alive());
-
-        // close_connection removes and closes it
-        handle.close_connection(peer).await;
-
-        // The connection map should no longer contain this peer
-        let conns = handle.connections.read().await;
-        assert!(!conns.contains_key(&peer));
-    }
-
-    #[tokio::test]
-    async fn test_connect_handle_close_connection_nonexistent_peer() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-        let handle = manager.split();
-
-        // Should not panic on non-existent peer
-        let peer = Addr::from([0u8; 32]);
-        handle.close_connection(peer).await;
-    }
-
-    #[tokio::test]
-    async fn test_writer_task_exit_marks_connection_dead() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let conn = new_encrypted_packet_conn(signing_key, Default::default());
-        let manager = StreamManager::new(conn);
-
-        let peer = Addr::from([11u8; 32]);
-        let connection = manager.connect(peer).await.unwrap();
-        assert!(connection.is_alive());
-
-        // Close the connection — this cancels the token which makes the writer
-        // task exit. After that, mark_dead should also fire. We just verify the
-        // connection is no longer alive after close.
-        connection.close().await;
-        assert!(!connection.is_alive());
+        assert_eq!(p1, EPHEMERAL_PORT_START);
+        assert_eq!(p2, EPHEMERAL_PORT_START + 1);
+        assert_eq!(p3, EPHEMERAL_PORT_START + 2);
     }
 }

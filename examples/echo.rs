@@ -1,24 +1,19 @@
-//! Simple echo server example
-//!
-//! Accepts incoming connections and streams, echoes back any data received.
+//! Simple echo server example (TCP/KEY)
 
 use ed25519_dalek::SigningKey;
 use ironwood::{new_encrypted_packet_conn, PacketConn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
-use ygg_stream::StreamManager;
+use ygg_stream::TcpStack;
 
-/// Default port for the echo service
 const ECHO_PORT: u16 = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter("info,ygg_stream=debug,ironwood=info")
         .init();
 
-    // Generate a random key for this node
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let conn = new_encrypted_packet_conn(signing_key, Default::default());
     let local_addr = conn.local_addr();
@@ -26,30 +21,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Echo server started");
     info!("Local address: {}", local_addr);
 
-    // Create stream manager
-    let manager = StreamManager::new(conn);
-
-    // Register a listener on the echo port
-    let mut listener = manager.listen(ECHO_PORT).await;
+    let stack = TcpStack::new(conn);
+    let mut listener = stack.listen(ECHO_PORT).await;
 
     info!("Listening on port {} for connections...", ECHO_PORT);
 
-    // Accept streams in a loop
     loop {
         match listener.accept().await {
-            Ok(stream) => {
-                let peer = stream.peer_addr();
-                info!("Accepted stream {} on port {} from peer {}", stream.id(), stream.port(), peer);
+            Ok(conn) => {
+                let peer = conn.remote_key();
+                info!("Accepted connection from peer {} on port {}", peer, ECHO_PORT);
 
-                // Spawn a task to handle this stream
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(stream).await {
-                        error!("Stream error: {}", e);
+                    if let Err(e) = handle_connection(conn).await {
+                        error!("Connection error: {}", e);
                     }
                 });
             }
             Err(e) => {
-                error!("Error accepting stream: {}", e);
+                error!("Error accepting connection: {}", e);
                 break;
             }
         }
@@ -58,24 +48,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_stream(mut stream: ygg_stream::Stream) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_connection(mut conn: ygg_stream::TcpConnection) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; 1024];
 
     loop {
-        let n = stream.read(&mut buf).await?;
+        let n = conn.read(&mut buf).await?;
         if n == 0 {
-            // EOF
-            info!("Stream {} closed by peer", stream.id());
+            info!("Connection closed by peer");
             break;
         }
 
-        info!("Stream {}: received {} bytes", stream.id(), n);
-
-        // Echo back
-        stream.write_all(&buf[..n]).await?;
-        stream.flush().await?;
-
-        info!("Stream {}: echoed {} bytes", stream.id(), n);
+        info!("Received {} bytes", n);
+        conn.write_all(&buf[..n]).await?;
+        conn.flush().await?;
+        info!("Echoed {} bytes", n);
     }
 
     Ok(())

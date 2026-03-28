@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Errors that can occur in stream operations
+/// Errors that can occur in TCP/KEY operations
 #[derive(Debug, Error)]
 pub enum Error {
     /// I/O error
@@ -15,25 +15,17 @@ pub enum Error {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
-    /// Stream closed by remote peer
-    #[error("Stream closed by peer")]
-    StreamClosed,
-
-    /// Stream was reset (aborted)
-    #[error("Stream reset")]
-    StreamReset,
-
-    /// Connection closed
-    #[error("Connection closed")]
+    /// Connection closed by remote peer
+    #[error("Connection closed by peer")]
     ConnectionClosed,
 
-    /// Invalid stream ID
-    #[error("Invalid stream ID: {0}")]
-    InvalidStreamId(u16),
+    /// Connection was reset (aborted)
+    #[error("Connection reset")]
+    ConnectionReset,
 
-    /// Stream already exists
-    #[error("Stream already exists: port={0} stream_id={1}")]
-    StreamExists(u16, u16),
+    /// Connection already exists
+    #[error("Connection already exists: local_port={0} remote_port={1}")]
+    ConnectionExists(u16, u16),
 
     /// No listener registered for port
     #[error("No listener for port {0}")]

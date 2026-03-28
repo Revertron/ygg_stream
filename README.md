@@ -1,222 +1,82 @@
-# ygg_stream: Stream Multiplexing for Yggdrasil
+# ygg_stream: TCP/KEY Protocol for Yggdrasil
 
-A lightweight stream multiplexing library built on top of ironwood's encrypted PacketConn. Provides QUIC-like ergonomics (multiple concurrent streams, AsyncRead/AsyncWrite) without the complexity of QUIC protocol implementation.
+A TCP-like transport protocol for the Yggdrasil mesh network. Uses 32-byte ed25519 public keys instead of IPv4 addresses — hence **TCP/KEY**.
 
 ## Features
 
-- **Multiple concurrent streams** per peer connection
-- **Port-based service routing** - multiple services on a single node (e.g., chat on port 1, file transfer on port 2)
-- **Stream-oriented API** - continuous byte streams with AsyncRead + AsyncWrite
-- **No additional encryption** - leverages Yggdrasil's existing encryption at PacketConn layer
-- **Simple custom protocol** - optimized for PacketConn semantics (7-byte header overhead)
-- **Flow control** - window-based flow control (256 KB default) prevents buffer overflow
-- **Graceful shutdown** - proper FIN handshake for clean stream closure
-- **Connectionless datagrams** - fire-and-forget messages (UDP-like) with port-based routing, no handshake or flow control
+- **Standard TCP semantics** — 3-way handshake, reliable ordered delivery, graceful shutdown (full RFC 793 state machine)
+- **Port-based routing** — 16-bit ports, just like TCP/IP. Multiple services on a single node
+- **AsyncRead + AsyncWrite** — each connection is a standard Rust async byte stream
+- **Congestion control** — TCP Reno (slow start, congestion avoidance, fast retransmit)
+- **RTT estimation** — Jacobson/Karels algorithm (RFC 6298) with Karn's algorithm
+- **Flow control** — 24-bit window (up to 16 MB), 512 KB default
+- **Connectionless datagrams** — fire-and-forget messages with port routing, no handshake
+- **No additional encryption** — leverages Yggdrasil's existing encryption at the PacketConn layer
+- **Mobile bindings** — UniFFI for Kotlin/Swift (Android/iOS)
+
+## Wire Protocol
+
+16-byte header, no length field (derived from Yggdrasil packet size):
+
+```
+ 0       8       16      24      32
++-------+-------+-------+-------+
+|  src_port(16) |  dst_port(16) |   bytes 0-3
++-------+-------+-------+-------+
+|         sequence number        |   bytes 4-7
++-------+-------+-------+-------+
+|       acknowledgment number    |   bytes 8-11
++-------+-------+-------+-------+
+| flags(8) |    window(24)      |   bytes 12-15
++-------+-------+-------+-------+
+|            payload...          |
+```
+
+**Flags**: SYN (0x01), ACK (0x02), FIN (0x04), RST (0x08), DGRAM (0x10)
+
+Addressing is provided by Yggdrasil's network layer — each peer is identified by its 32-byte ed25519 public key. No addresses appear in the header.
 
 ## Architecture
 
 ```
 Application
     ↓
-ygg_stream (stream multiplexing + port routing)
+TCP/KEY (TcpStack → TcpConnection)
     ↓
-ironwood (encrypted PacketConn)
+ironwood (encrypted PacketConn, public key addressing)
+    ↓
+Yggdrasil mesh network (TCP/TLS links)
 ```
 
-### Protocol Design
+A connection is identified by a 3-tuple: `(local_port, remote_key, remote_port)` — analogous to TCP's 4-tuple, but with the local key implicit.
 
-**Packet Format** (7 bytes + data):
-```
-[port:u16][stream_id:u16][flags: u8][length: u16][data: bytes]
-```
+## Quick Start
 
-**Flags**:
-- `SYN (0x01)`: Open stream
-- `ACK (0x02)`: Acknowledge
-- `FIN (0x04)`: Close gracefully
-- `RST (0x08)`: Reset stream (immediate close)
-- `DGRAM (0x10)`: Connectionless datagram (no stream_id, no handshake)
-
-**Stream Lifecycle**:
-1. **SYN**: Initiator opens stream on a port
-2. **SYN-ACK**: Acceptor responds (if a listener is registered for the port)
-3. **DATA**: Bidirectional data transfer with ACK
-4. **FIN**: Graceful close (both sides send FIN)
-5. **RST**: Immediate close (error, abort, or no listener on port)
-
-**Port Routing**:
-- Each node registers listeners on specific ports via `listen(port)`
-- Incoming SYN packets for ports without a listener receive an RST
-- Different services bind different ports, each with their own accept channel
-
-**Datagrams**:
-- Fire-and-forget messages routed by port only (`stream_id = 0`)
-- No handshake, no flow control, no ordering — like UDP
-- Register with `listen_datagram(port)`, send with `send_datagram(peer, port, data)`
-- Dropped silently if no listener or channel is full
-
-**Stream ID Allocation**:
-- Initiator uses **odd IDs** (1, 3, 5, ...)
-- Acceptor uses **even IDs** (2, 4, 6, ...)
-- Prevents collision when both sides open simultaneously
-
-## Integration with Yggdrasil
-
-The `ygg_stream` library is designed to work seamlessly with a complete Yggdrasil node.
-The Yggdrasil `Core` handles all network transport (TCP/TLS listeners and peer connections), while `ygg_stream` provides stream multiplexing on top.
-
-### Complete Node Example
+### Server
 
 ```rust
-use ed25519_dalek::SigningKey;
-use yggdrasil::config::Config;
-use yggdrasil::core::Core;
-use ygg_stream::StreamManager;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const MY_SERVICE_PORT: u16 = 1;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create Yggdrasil configuration
-    let mut config = Config::default();
-    config.listen = vec!["tcp://0.0.0.0:1234".to_string()];
-    config.peers = vec!["tcp://peer.example.com:1234".to_string()];
-
-    // Create Yggdrasil core
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let core = Core::new(signing_key, config);
-
-    // Initialize and start the node
-    core.init_links().await;
-    core.start().await;  // Starts TCP listeners and connects to peers
-
-    // Create stream manager on top of Yggdrasil core
-    let stream_manager = StreamManager::new(core.packet_conn());
-
-    // Register a listener on our service port
-    let mut listener = stream_manager.listen(MY_SERVICE_PORT).await;
-
-    // Accept incoming streams on this port
-    let mut stream = listener.accept().await?;
-
-    // Use standard async I/O
-    let mut buf = vec![0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    stream.write_all(&buf[..n]).await?;
-
-    Ok(())
-}
-```
-
-## High-Level API: AsyncNode / Node
-
-For applications that just want to connect and exchange data without manually wiring up `Core` + `StreamManager`, the library provides two convenience wrappers:
-
-| Type | Environment | I/O style |
-|------|-------------|-----------|
-| `AsyncNode` / `AsyncConn` | Inside a tokio runtime | `async fn` |
-| `Node` / `Conn` | Blocking / FFI (Android) | Blocking (`block_on`) |
-
-Both expose the same operations: `connect`, `accept`, `listen`, `send_datagram`, `recv_datagram`, peer management, and network introspection.
-
-### AsyncNode (async)
-
-Use `AsyncNode` when your application already runs inside a tokio runtime. No internal runtime is created — all methods are `async fn`.
-
-```rust
-use ygg_stream::AsyncNode;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-#[tokio::main]
-async fn main() -> Result<(), String> {
-    // Start a node and connect to a peer
-    let node = AsyncNode::new("tcp://1.2.3.4:1234").await?;
-    println!("My key: {}", hex::encode(node.public_key()));
-
-    // Client: connect and open a stream on port 80
-    let conn = node.connect(&peer_key, 80).await?;
-    conn.write(b"hello").await?;
-    let mut buf = vec![0u8; 1024];
-    let n = conn.read(&mut buf).await?;
-    conn.close().await;
-
-    // Server: accept streams on port 80
-    let mut listener = node.listen(80).await;
-    loop {
-        let stream = listener.accept().await.unwrap();
-        tokio::spawn(async move {
-            // handle stream...
-        });
-    }
-}
-```
-
-### Node (blocking / FFI)
-
-Use `Node` when calling from a synchronous context (e.g., Java/Kotlin via UniFFI). It owns a tokio `Runtime` internally and calls `block_on()` for every operation.
-
-```rust
-use ygg_stream::Node;
-
-fn main() -> Result<(), String> {
-    let node = Node::new("tcp://1.2.3.4:1234")?;
-
-    // Client
-    let conn = node.connect(&peer_key, 80)?;
-    conn.write(b"hello")?;
-    let mut buf = vec![0u8; 1024];
-    let n = conn.read(&mut buf)?;
-    conn.close();
-
-    // Server
-    let conn = node.accept(80)?;
-    // ...
-
-    node.close();
-    Ok(())
-}
-```
-
-> **Note**: Do not use `Node`/`Conn` from inside a tokio runtime — calling `block_on()` within an async context will panic. Use `AsyncNode`/`AsyncConn` instead.
-
-## Low-Level API: StreamManager
-
-For full control over the Yggdrasil core and stream multiplexing, use `StreamManager` and `ConnectHandle` directly.
-
-## Usage Examples
-
-### Echo Server
-
-```rust
-use ed25519_dalek::SigningKey;
+use ygg_stream::{TcpStack, TcpConnection};
 use ironwood::{new_encrypted_packet_conn, PacketConn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ygg_stream::StreamManager;
-
-const ECHO_PORT: u16 = 1;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create ironwood node
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let conn = new_encrypted_packet_conn(signing_key, Default::default());
 
-    // Create stream manager and listen on a port
-    let manager = StreamManager::new(conn);
-    let mut listener = manager.listen(ECHO_PORT).await;
+    let stack = TcpStack::new(conn);
+    let mut listener = stack.listen(80).await;
 
-    // Accept streams
     loop {
-        let mut stream = listener.accept().await?;
+        let mut conn = listener.accept().await?;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1024];
             loop {
-                let n = stream.read(&mut buf).await?;
+                let n = conn.read(&mut buf).await?;
                 if n == 0 { break; }
-                stream.write_all(&buf[..n]).await?;
+                conn.write_all(&buf[..n]).await?;
             }
-            Ok::<_, Box<dyn std::error::Error>>(())
+            Ok::<_, std::io::Error>(())
         });
     }
 }
@@ -225,232 +85,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Client
 
 ```rust
-use ed25519_dalek::SigningKey;
-use ironwood::{new_encrypted_packet_conn, Addr, PacketConn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ygg_stream::StreamManager;
+let stack = TcpStack::new(conn);
+let mut connection = stack.connect(peer_addr, 80).await?;
 
-const ECHO_PORT: u16 = 1;
+connection.write_all(b"Hello, Yggdrasil!").await?;
+let mut buf = vec![0u8; 1024];
+let n = connection.read(&mut buf).await?;
+println!("Response: {}", String::from_utf8_lossy(&buf[..n]));
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let conn = new_encrypted_packet_conn(signing_key, Default::default());
-
-    let manager = StreamManager::new(conn);
-
-    // Connect to peer and open a stream on the echo port
-    let peer_key: [u8; 32] = /* peer's public key */;
-    let connection = manager.connect(Addr::from(peer_key)).await?;
-    let mut stream = connection.open_stream(ECHO_PORT).await?;
-
-    // Send/receive data
-    stream.write_all(b"Hello, Yggdrasil!").await?;
-    let mut buf = vec![0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    println!("Received: {}", String::from_utf8_lossy(&buf[..n]));
-
-    stream.shutdown().await?;
-    Ok(())
-}
+connection.shutdown().await?;
 ```
 
-### Multiple Services on One Node
+## High-Level API
+
+For applications that don't need to wire up `Core` + `TcpStack` manually:
+
+| Type | Environment | I/O style |
+|------|-------------|-----------|
+| `AsyncNode` / `AsyncConn` | Inside a tokio runtime | `async fn` |
+| `Node` / `Conn` | Blocking / FFI (Android) | Blocking (`block_on`) |
+
+Both expose: `connect(pubkey, port)`, `accept(port)`, `listen(port)`, `send_datagram`, `recv_datagram`, peer management, and network introspection.
+
+### AsyncNode
 
 ```rust
-const CHAT_PORT: u16 = 1;
-const FILE_PORT: u16 = 2;
+let node = AsyncNode::new("tcp://1.2.3.4:1234").await?;
 
-let manager = StreamManager::new(conn);
+// Client
+let conn = node.connect(&peer_key, 80).await?;
+conn.write(b"hello").await?;
+let mut buf = vec![0u8; 1024];
+let n = conn.read(&mut buf).await?;
+conn.close().await;
 
-// Each service gets its own listener
-let mut chat_listener = manager.listen(CHAT_PORT).await;
-let mut file_listener = manager.listen(FILE_PORT).await;
+// Server
+let conn = node.accept(80).await?;
+```
 
-// Handle each service independently
+### Node (blocking / FFI)
+
+```rust
+let node = Node::new("tcp://1.2.3.4:1234")?;
+let conn = node.connect(&peer_key, 80)?;
+conn.write(b"hello")?;
+conn.close();
+```
+
+> **Note**: Do not use `Node`/`Conn` from inside a tokio runtime — `block_on()` will panic. Use `AsyncNode`/`AsyncConn` instead.
+
+## Full Yggdrasil Node
+
+```rust
+use yggdrasil::config::Config;
+use yggdrasil::core::Core;
+use ygg_stream::TcpStack;
+
+let mut config = Config::default();
+config.listen = vec!["tcp://0.0.0.0:1234".to_string()];
+config.peers = vec!["tcp://peer.example.com:1234".to_string()];
+
+let core = Core::new(signing_key, config);
+core.init_links().await;
+core.start().await;
+
+let stack = TcpStack::new(core.packet_conn());
+let mut listener = stack.listen(80).await;
+let conn = listener.accept().await?;
+```
+
+## Datagrams
+
+Connectionless messages, routed by port. No handshake, no ordering, no flow control.
+
+```rust
+// Send
+stack.send_datagram(&peer_addr, 42, b"ping".to_vec()).await?;
+
+// Receive
+let mut dg = stack.listen_datagram(42).await;
+let (data, sender) = dg.recv().await?;
+```
+
+## Multiple Services
+
+```rust
+let mut chat = stack.listen(1).await;
+let mut files = stack.listen(2).await;
+
 tokio::spawn(async move {
-    loop {
-        let stream = chat_listener.accept().await?;
-        // handle chat stream...
-    }
+    loop { let conn = chat.accept().await?; /* handle chat */ }
 });
-
 tokio::spawn(async move {
-    loop {
-        let stream = file_listener.accept().await?;
-        // handle file transfer stream...
-    }
+    loop { let conn = files.accept().await?; /* handle files */ }
 });
 ```
 
-### Multiple Concurrent Streams
+## Connection Lifecycle
 
-```rust
-let connection = manager.connect(peer_addr).await?;
-
-// Open multiple streams on the same port
-let mut stream1 = connection.open_stream(1).await?;
-let mut stream2 = connection.open_stream(1).await?;
-let mut stream3 = connection.open_stream(1).await?;
-
-// Use streams independently in parallel
-tokio::spawn(async move {
-    stream1.write_all(b"Stream 1 data").await?;
-    Ok::<_, Box<dyn std::error::Error>>(())
-});
-
-tokio::spawn(async move {
-    stream2.write_all(b"Stream 2 data").await?;
-    Ok::<_, Box<dyn std::error::Error>>(())
-});
 ```
-
-### Connectionless Datagrams
-
-```rust
-let manager = StreamManager::new(conn);
-
-// Receive side: listen for datagrams on a port
-let mut dg_listener = manager.listen_datagram(42).await;
-tokio::spawn(async move {
-    while let Ok((data, sender)) = dg_listener.recv().await {
-        println!("Got {} bytes from {:?}", data.len(), sender);
-    }
-});
-
-// Send side: fire-and-forget, no connection needed
-manager.send_datagram(&peer_addr, 42, b"ping".to_vec()).await?;
+Client                          Server
+  |                               |
+  |--- SYN (src=ephemeral,dst) -->|  SynSent → SynReceived
+  |<-- SYN-ACK --------------------|
+  |--- ACK ----------------------->|  Established ← Established
+  |                               |
+  |<== DATA (AsyncRead/Write) ===>|
+  |                               |
+  |--- FIN ----------------------->|  FinWait1 → CloseWait
+  |<-- ACK -----------------------|  FinWait2
+  |<-- FIN -----------------------|  TimeWait ← LastAck
+  |--- ACK ----------------------->|  (2s) → Closed ← Closed
 ```
 
 ## Running Examples
 
-### Full Yggdrasil Node with Stream Multiplexing
-
-**Server** (listens on TCP port 1234):
 ```bash
-cargo run -p ygg_stream --example full_node --features full-node server
+# Echo server
+cargo run --example echo
+
+# Client (needs peer's hex public key)
+cargo run --example client <peer_public_key_hex>
+
+# Full Yggdrasil node
+cargo run --example full_node --features full-node server
+cargo run --example full_node --features full-node client tcp://127.0.0.1:1234 <key>
 ```
-
-**Client** (connects to server):
-```bash
-cargo run -p ygg_stream --example full_node --features full-node client tcp://127.0.0.1:1234 <server_public_key_hex>
-```
-
-This example demonstrates:
-- Complete Yggdrasil node with TCP transport
-- Automatic peer connection management
-- Stream multiplexing with port-based routing
-- Bidirectional communication
-
-### Echo Server (standalone, for testing)
-```bash
-cargo run -p ygg_stream --example echo
-```
-
-### Client (standalone, for testing)
-```bash
-cargo run -p ygg_stream --example client <peer_public_key_hex>
-```
-
-## Implementation Details
-
-### Components
-
-1. **StreamManager** (`manager.rs`)
-   - Manages connections and stream multiplexing per peer
-   - Per-port `Listener` channels for service routing
-   - Background reader task demultiplexes packets to connections and port listeners
-   - Background writer tasks aggregate packets from streams
-   - Sends RST for incoming streams on ports without a listener
-
-2. **Listener** (`manager.rs`)
-   - Per-port accept channel returned by `listen(port)`
-   - `accept()` yields incoming streams on that port
-
-3. **DatagramListener** (`manager.rs`)
-   - Per-port datagram channel returned by `listen_datagram(port)`
-   - `recv()` yields `(data, sender_addr)` pairs
-   - Bounded channel — datagrams dropped silently when full
-
-4. **Connection** (`connection.rs`)
-   - Represents multiplexed connection to single peer
-   - Manages multiple streams keyed by (port, stream_id)
-   - Stream ID allocation (odd/even separation)
-
-5. **Stream** (`stream.rs`)
-   - Individual bidirectional stream with port and stream_id
-   - Implements `AsyncRead` + `AsyncWrite`
-   - Flow control with send/receive windows
-   - State machine: Opening → Open → Closing → Closed
-
-6. **Protocol** (`protocol.rs`)
-   - Packet encoding/decoding
-   - Port + stream_id packed into a single u32 on the wire
-   - Protocol constants and flags
-
-### Flow Control
-
-Each stream tracks:
-- **send_window**: Bytes we can send (based on peer's last ACK)
-- **recv_window**: Bytes we can receive (our buffer space)
-
-On write:
-- Check available window
-- Send up to window size
-- Decrease send_window
-- Wait for ACK to increase window
-
-On receive:
-- Buffer data
-- Update recv_window
-- Send ACK with current window size
-
-## Testing
-
-Run tests:
-```bash
-cargo test -p ygg_stream
-```
-
-Integration tests demonstrate:
-- Bidirectional communication
-- Multiple concurrent streams
-- Port-based stream routing
-- Stream ID allocation
-- Connection lifecycle
-- Connectionless datagram send/receive
-
-## Advantages Over QUIC
-
-1. **Simpler**: ~1000 LOC vs ~3000+ for QUIC integration
-2. **No Dependencies**: Custom protocol, no Quinn/rustls
-3. **No Address Translation**: Direct use of ed25519 keys
-4. **No TLS Overhead**: Yggdrasil already encrypts
-5. **Optimized**: Designed for PacketConn semantics
-6. **Cleaner API**: Native Rust async I/O, no QUIC concepts
 
 ## Performance
 
-- **Header Overhead**: 7 bytes per packet (vs ~14+ for QUIC)
-- **Max Packet Size**: 65,535 bytes
-- **Default Window Size**: 256 KB (configurable)
-- **Connection Pooling**: Reuses existing connections
+- **Header overhead**: 16 bytes per packet
+- **Max payload**: ~65,385 bytes per packet
+- **Default window**: 512 KB
+- **Pacing**: 10 ms inter-packet interval (matches ironwood's queue budget)
+- **Congestion window**: starts at 32 KB, grows via TCP Reno
 
-## Future Enhancements
+## Testing
 
-Potential additions (not currently implemented):
-- Priority streams (weighted fair queuing)
-- Stream cancellation with reason codes
-- Connection migration
-- Advanced congestion control
-- Zero-copy optimizations
-- Connection statistics
-
-## License
-
-This project is licensed under the **Mozilla Public License 2.0 (MPL-2.0)** as the `ironwood`. See the [LICENSE](LICENSE) file for the full license text.
+```bash
+cargo test --lib    # 28 unit tests
+cargo test          # All tests
+```
 
 ## Contributing
 
 Contributions are not very welcome! Please don't feel free to submit issues or pull requests.
 Ensure your code follows the project's own style guidelines and passes all tests.
+
+## License
+
+Mozilla Public License 2.0 (MPL-2.0). See [LICENSE](LICENSE).

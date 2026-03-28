@@ -1,52 +1,21 @@
-//! Stream multiplexing library for Yggdrasil mesh network
+//! TCP/KEY — TCP-like transport over Yggdrasil mesh network
 //!
-//! This crate provides QUIC-like stream multiplexing on top of ironwood's
-//! `EncryptedPacketConn`. It allows applications to:
+//! This crate provides TCP semantics over ironwood's `EncryptedPacketConn`,
+//! using 32-byte ed25519 public keys instead of IPv4 addresses.
 //!
-//! - Open multiple concurrent streams per peer connection
-//! - Use standard Rust async I/O traits (AsyncRead, AsyncWrite)
-//! - Avoid MTU concerns - streams provide continuous byte streams
-//! - Leverage Yggdrasil's existing encryption (no additional overhead)
+//! - Standard TCP state machine (RFC 793)
+//! - Port-based service routing (16-bit ports)
+//! - AsyncRead/AsyncWrite on each connection
+//! - UniFFI bindings for Kotlin/Swift mobile apps
 //!
 //! # Architecture
 //!
 //! ```text
 //! Application
 //!     ↓
-//! ygg_stream (stream multiplexing)
+//! TCP/KEY (TcpStack → TcpConnection)
 //!     ↓
-//! ironwood (encrypted PacketConn)
-//! ```
-//!
-//! # Example Usage
-//!
-//! ```rust,ignore
-//! use ygg_stream::StreamManager;
-//! use ironwood::new_encrypted_packet_conn;
-//! use ed25519_dalek::SigningKey;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create ironwood node
-//!     let signing_key = SigningKey::generate(&mut rand::thread_rng());
-//!     let conn = new_encrypted_packet_conn(signing_key, Default::default());
-//!
-//!     // Create stream manager
-//!     let manager = StreamManager::new(conn);
-//!
-//!     // Accept incoming connection
-//!     let connection = manager.accept().await?;
-//!
-//!     // Accept incoming stream
-//!     let mut stream = connection.accept_stream().await?;
-//!
-//!     // Use standard async I/O
-//!     let mut buf = vec![0u8; 1024];
-//!     let n = stream.read(&mut buf).await?;
-//!     stream.write_all(&buf[..n]).await?;
-//!
-//!     Ok(())
-//! }
+//! ironwood (encrypted PacketConn, public key addressing)
 //! ```
 
 // UniFFI scaffolding — must be in the crate root.
@@ -61,13 +30,12 @@ pub mod ffi;
 pub mod manager;
 pub mod node;
 pub mod protocol;
-pub mod stream;
 
 // Re-export main types
 pub use async_node::{AsyncConn, AsyncNode};
-pub use connection::Connection;
+pub use connection::{ConnKey, TcpConnection, TcpState};
 pub use error::{Error, Result};
-pub use manager::{ConnectHandle, DatagramListener, Listener, StreamManager};
+pub use manager::{ConnectHandle, DatagramListener, TcpListener, TcpStack};
 pub use node::{Conn, Node};
+pub use ironwood::Addr;
 pub use protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_PACKET_SIZE};
-pub use stream::{Stream, StreamState};
