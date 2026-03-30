@@ -14,6 +14,16 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Start of ephemeral port range
 const EPHEMERAL_PORT_START: u16 = 49152;
+/// Number of ports in the ephemeral range (49152..=65535)
+const EPHEMERAL_PORT_COUNT: u16 = 65535 - EPHEMERAL_PORT_START + 1;
+
+/// Pick a random starting port in the ephemeral range
+fn random_ephemeral_port() -> u16 {
+    let mut buf = [0u8; 2];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+    let offset = u16::from_le_bytes(buf) % EPHEMERAL_PORT_COUNT;
+    EPHEMERAL_PORT_START + offset
+}
 
 // ── TcpListener ────────────────────────────────────────────────────────────
 
@@ -129,7 +139,7 @@ impl TcpStack {
             listeners,
             datagram_listeners,
             outgoing: outgoing_tx,
-            next_ephemeral_port: AtomicU16::new(EPHEMERAL_PORT_START),
+            next_ephemeral_port: AtomicU16::new(random_ephemeral_port()),
             cancel,
         }
     }
@@ -475,7 +485,7 @@ async fn reader_task(
                 let (n, remote_key) = result?;
                 trace!("Received {} bytes from {}", n, hex::encode(&remote_key.as_ref()[..8]));
 
-                let packet = match Packet::decode(&buf[..n]) {
+                let mut packet = match Packet::decode(&buf[..n]) {
                     Ok(p) => p,
                     Err(e) => {
                         debug!("Decode error from {}: {}", hex::encode(&remote_key.as_ref()[..8]), e);
@@ -505,8 +515,16 @@ async fn reader_task(
                 };
 
                 if let Some(tx) = sender {
-                    let _ = tx.send(packet).await;
-                    continue;
+                    match tx.send(packet).await {
+                        Ok(()) => { continue; }
+                        Err(mpsc::error::SendError(returned)) => {
+                            // Connection task has exited — remove stale entry
+                            // and re-handle the packet as a potential new SYN.
+                            debug!("Removing stale connection {:?}", key);
+                            connections.write().await.remove(&key);
+                            packet = returned;
+                        }
+                    }
                 }
 
                 // No existing connection — handle SYN for new connections
@@ -711,8 +729,9 @@ mod tests {
         let p2 = stack.allocate_ephemeral_port();
         let p3 = stack.allocate_ephemeral_port();
 
-        assert_eq!(p1, EPHEMERAL_PORT_START);
-        assert_eq!(p2, EPHEMERAL_PORT_START + 1);
-        assert_eq!(p3, EPHEMERAL_PORT_START + 2);
+        // Ports are sequential (starting from a random offset)
+        assert!(p1 >= EPHEMERAL_PORT_START);
+        assert_eq!(p2, p1.wrapping_add(1));
+        assert_eq!(p3, p1.wrapping_add(2));
     }
 }
