@@ -1,7 +1,7 @@
 use crate::connection::{ConnKey, TcpConnection, TcpState};
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Packet, MAX_DATA_SIZE, MAX_SYN_RETRIES, PACING_INTERVAL_MS,
+    Packet, MAX_DATA_SIZE, MAX_SYN_RETRIES,
     SYN_INITIAL_RETRY_MS,
 };
 use ironwood::{Addr, EncryptedPacketConn, PacketConn};
@@ -600,8 +600,6 @@ async fn writer_task(
     cancel: CancellationToken,
 ) {
     let mut pkt_count = 0u64;
-    let mut last_send = tokio::time::Instant::now();
-    let pacing = tokio::time::Duration::from_millis(PACING_INTERVAL_MS);
 
     loop {
         tokio::select! {
@@ -610,17 +608,10 @@ async fn writer_task(
                     Some((data, peer)) => {
                         pkt_count += 1;
 
-                        // Pacing
-                        let elapsed = last_send.elapsed();
-                        if elapsed < pacing {
-                            tokio::time::sleep(pacing - elapsed).await;
-                        }
-
                         if let Err(e) = conn.write_to(&data, &peer).await {
                             error!("write_to failed: {}", e);
                             return;
                         }
-                        last_send = tokio::time::Instant::now();
                     }
                     None => {
                         info!("Writer task: channel closed (sent {} pkts)", pkt_count);

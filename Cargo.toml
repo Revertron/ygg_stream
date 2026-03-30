@@ -7,8 +7,8 @@ description = "Stream multiplexing library for Yggdrasil mesh network"
 license = "MPL-2.0"
 
 [dependencies]
-ironwood = { git = "https://github.com/Revertron/Yggdrasil-ng", tag = "v0.1.4" }
-yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", tag = "v0.1.4"  }
+ironwood = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "33e4056e" }
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "33e4056e"  }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "codec"] }
 bytes = "1"

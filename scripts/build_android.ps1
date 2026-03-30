@@ -119,7 +119,7 @@ New-Item -ItemType Directory -Force $BindingsDir | Out-Null
 
 Push-Location $Root
 try {
-    & cargo run --bin uniffi-bindgen -- generate `
+    & cargo run --bin uniffi-bindgen --features="ffi" -- generate `
         --library $RefLib `
         --language kotlin `
         --out-dir $BindingsDir

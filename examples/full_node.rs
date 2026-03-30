@@ -1,4 +1,4 @@
-//! Complete Yggdrasil node with stream multiplexing
+//! Complete Yggdrasil node with TCP/KEY echo service
 //!
 //! This example shows how to integrate ygg_stream with a full Yggdrasil node
 //! that has TCP/TLS listeners and peer connections.
@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
-use ygg_stream::StreamManager;
+use ygg_stream::TcpStack;
 
 const YGG_NODE: &str = "tcp://192.168.44.77:7743";
 
@@ -50,63 +50,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     info!("Yggdrasil routing should be ready");
 
-    // Create stream manager using the Yggdrasil core's packet connection
-    let stream_manager = StreamManager::new(core.packet_conn());
+    // Create TcpStack using the Yggdrasil core's packet connection
+    let stack = TcpStack::new(core.packet_conn());
 
     if mode == "server" {
-        info!("Stream manager ready - listening on port {} for incoming streams...", ECHO_PORT);
-        run_server(stream_manager).await?;
+        info!("TcpStack ready - listening on port {} for incoming connections...", ECHO_PORT);
+        run_server(&stack).await?;
     } else {
-        info!("Stream manager ready - will connect to peer");
+        info!("TcpStack ready - will connect to peer");
 
         // In client mode, we need to know the server's public key
         let server_pubkey = args.get(2)
             .ok_or("Usage: full_node client SERVER_PUBLIC_KEY_HEX")?;
 
-        run_client(stream_manager, server_pubkey).await?;
+        run_client(&stack, server_pubkey).await?;
     }
+
+    stack.close().await;
 
     Ok(())
 }
 
-async fn run_server(manager: StreamManager) -> Result<(), Box<dyn std::error::Error>> {
-    // Register a listener on the echo port
-    let mut listener = manager.listen(ECHO_PORT).await;
+async fn run_server(stack: &TcpStack) -> Result<(), Box<dyn std::error::Error>> {
+    let mut listener = stack.listen(ECHO_PORT).await;
 
     loop {
-        // Accept incoming streams on the echo port
         match listener.accept().await {
-            Ok(mut stream) => {
-                let peer = stream.peer_addr();
-                info!("Accepted stream {} on port {} from peer {}",
-                    stream.id(),
-                    stream.port(),
-                    hex::encode(&peer.as_ref()[..8])
-                );
+            Ok(mut conn) => {
+                let peer = conn.remote_key();
+                info!("Accepted connection from peer {} on port {}", peer, ECHO_PORT);
 
-                // Spawn task to handle this stream
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 1024];
                     loop {
-                        match stream.read(&mut buf).await {
+                        match conn.read(&mut buf).await {
                             Ok(0) => {
-                                info!("Stream {} closed by peer", stream.id());
+                                info!("Connection closed by peer");
                                 break;
                             }
                             Ok(n) => {
-                                info!("Stream {}: received {} bytes", stream.id(), n);
+                                info!("Received {} bytes", n);
 
                                 // Echo back
-                                if let Err(e) = stream.write_all(&buf[..n]).await {
+                                if let Err(e) = conn.write_all(&buf[..n]).await {
                                     error!("Write error: {}", e);
                                     break;
                                 }
-                                if let Err(e) = stream.flush().await {
+                                if let Err(e) = conn.flush().await {
                                     error!("Flush error: {}", e);
                                     break;
                                 }
 
-                                info!("Stream {}: echoed {} bytes", stream.id(), n);
+                                info!("Echoed {} bytes", n);
                             }
                             Err(e) => {
                                 error!("Read error: {}", e);
@@ -117,7 +112,7 @@ async fn run_server(manager: StreamManager) -> Result<(), Box<dyn std::error::Er
                 });
             }
             Err(e) => {
-                error!("Error accepting stream: {}", e);
+                error!("Error accepting connection: {}", e);
                 break;
             }
         }
@@ -126,7 +121,7 @@ async fn run_server(manager: StreamManager) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-async fn run_client(manager: StreamManager, server_pubkey_hex: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_client(stack: &TcpStack, server_pubkey_hex: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Decode server public key
     let pubkey_bytes = hex::decode(server_pubkey_hex)?;
     if pubkey_bytes.len() != 32 {
@@ -138,40 +133,30 @@ async fn run_client(manager: StreamManager, server_pubkey_hex: &str) -> Result<(
 
     info!("Connecting to server with public key {}", server_pubkey_hex);
 
-    // Wait a bit for the peer connection to be established
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-    // Connect to server
-    let connection = manager.connect(server_addr).await?;
-    info!("Connected to server!");
-
-    // Open a stream on the echo port
-    let mut stream = connection.open_stream(ECHO_PORT).await?;
-    info!("Opened stream {} on port {}", stream.id(), stream.port());
+    // Connect to server on the echo port
+    let mut connection = stack.connect(server_addr, ECHO_PORT).await?;
+    info!("Connected to server on port {}", ECHO_PORT);
 
     // Send some messages
     for i in 1..=5 {
         let message = format!("Hello from client, message {}", i);
         info!("Sending: {}", message);
 
-        stream.write_all(message.as_bytes()).await?;
-        stream.flush().await?;
+        connection.write_all(message.as_bytes()).await?;
+        connection.flush().await?;
 
         // Read response
         let mut buf = vec![0u8; 1024];
-        let n = stream.read(&mut buf).await?;
+        let n = connection.read(&mut buf).await?;
         let response = String::from_utf8_lossy(&buf[..n]);
         info!("Received: {}", response);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 
-    // Close stream
-    stream.shutdown().await?;
-    info!("Stream closed gracefully");
-
-    // Keep connection alive for a bit
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Close gracefully
+    connection.shutdown().await?;
+    info!("Connection closed gracefully");
 
     Ok(())
 }

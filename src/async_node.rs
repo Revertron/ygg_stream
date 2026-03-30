@@ -360,6 +360,14 @@ impl AsyncNode {
         serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Force a path lookup for the given destination key.
+    /// This ensures the remote peer learns our path (from the PathNotify response),
+    /// which is required for it to route traffic back to us.
+    /// Returns the number of peers the lookup was multicast to.
+    pub async fn force_lookup(&self, public_key: &[u8; 32]) -> usize {
+        self.core.force_lookup(*public_key).await
+    }
+
     pub async fn close(&self) {
         self.handle.close_all().await;
         self.listeners.lock().await.clear();
