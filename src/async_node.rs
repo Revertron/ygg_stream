@@ -26,6 +26,7 @@ pub struct AsyncConn {
     conn: TcpConnection,
     public_key: Vec<u8>,
     port: u16,
+    write_mutex: Arc<Mutex<()>>,
 }
 
 impl AsyncConn {
@@ -34,6 +35,7 @@ impl AsyncConn {
             conn,
             public_key,
             port,
+            write_mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -69,6 +71,7 @@ impl AsyncConn {
     }
 
     pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
+        let _guard = self.write_mutex.lock().await;
         let mut c = self.conn.clone();
         AsyncWriteExt::write_all(&mut c, buf)
             .await
@@ -82,8 +85,12 @@ impl AsyncConn {
             return self.write(buf).await;
         }
         let dur = Duration::from_millis(timeout_ms as u64);
+        let _guard = self.write_mutex.lock().await;
         let mut c = self.conn.clone();
-        tokio::time::timeout(dur, AsyncWriteExt::write_all(&mut c, buf))
+        tokio::time::timeout(dur, async {
+            AsyncWriteExt::write_all(&mut c, buf).await?;
+            c.flush().await
+        })
             .await
             .map_err(|_| "timeout".to_string())?
             .map_err(|e| e.to_string())?;
