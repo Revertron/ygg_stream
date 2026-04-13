@@ -124,7 +124,7 @@ impl AsyncNode {
         if !peer_addr.is_empty() {
             config.peers = vec![peer_addr.to_string()];
         }
-        Self::from_key_and_config(signing_key, config).await
+        Self::from_key_and_config(signing_key, config, false).await
     }
 
     pub async fn new_with_key(signing_key_bytes: &[u8], peers: Vec<String>) -> Result<Self, String> {
@@ -134,13 +134,30 @@ impl AsyncNode {
         let signing_key = SigningKey::from_bytes(&bytes);
         let mut config = Config::default();
         config.peers = peers;
-        Self::from_key_and_config(signing_key, config).await
+        Self::from_key_and_config(signing_key, config, false).await
     }
 
-    async fn from_key_and_config(signing_key: SigningKey, config: Config) -> Result<Self, String> {
+    /// Create a node with multicast peer discovery enabled.
+    pub async fn new_with_multicast(signing_key_bytes: &[u8], peers: Vec<String>) -> Result<Self, String> {
+        let bytes: [u8; 32] = signing_key_bytes
+            .try_into()
+            .map_err(|_| "signing key must be exactly 32 bytes".to_string())?;
+        let signing_key = SigningKey::from_bytes(&bytes);
+        let mut config = Config::default();
+        config.peers = peers;
+        Self::from_key_and_config(signing_key, config, true).await
+    }
+
+    async fn from_key_and_config(signing_key: SigningKey, config: Config, enable_multicast: bool) -> Result<Self, String> {
         let core = Core::new(signing_key, config);
         core.init_links().await;
         core.start().await;
+
+        if enable_multicast {
+            if let Err(e) = core.start_multicast().await {
+                tracing::warn!("Multicast peer discovery disabled: {}", e);
+            }
+        }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -375,7 +392,14 @@ impl AsyncNode {
         self.core.force_lookup(*public_key).await
     }
 
+    /// Provide network interface info from an external source (e.g. Android ConnectivityManager).
+    /// When set, multicast discovery uses these interfaces instead of `getifaddrs()`.
+    pub fn update_network_interfaces(&self, ifaces: Vec<yggdrasil::multicast::NetworkInterface>) {
+        self.core.update_network_interfaces(ifaces);
+    }
+
     pub async fn close(&self) {
+        self.core.close_multicast().await;
         self.handle.close_all().await;
         self.listeners.lock().await.clear();
         self.datagram_listeners.lock().await.clear();

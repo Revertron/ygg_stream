@@ -39,3 +39,4 @@ pub use manager::{ConnectHandle, DatagramListener, TcpListener, TcpStack};
 pub use node::{Conn, Node};
 pub use ironwood::Addr;
 pub use protocol::{Packet, DEFAULT_WINDOW_SIZE, MAX_PACKET_SIZE};
+pub use yggdrasil::multicast::NetworkInterface;
