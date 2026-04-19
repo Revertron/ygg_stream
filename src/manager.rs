@@ -261,14 +261,7 @@ impl TcpStack {
     }
 
     fn allocate_ephemeral_port(&self) -> u16 {
-        let port = self.next_ephemeral_port.fetch_add(1, Ordering::Relaxed);
-        if port == 0 {
-            // Wrapped around — skip 0 and restart from EPHEMERAL_PORT_START
-            self.next_ephemeral_port.store(EPHEMERAL_PORT_START + 1, Ordering::Relaxed);
-            EPHEMERAL_PORT_START
-        } else {
-            port
-        }
+        allocate_ephemeral_port_from(&self.next_ephemeral_port)
     }
 
     /// Close all connections and shut down.
@@ -457,12 +450,34 @@ impl ConnectHandle {
     }
 
     fn allocate_ephemeral_port(&self) -> u16 {
-        let port = self.next_ephemeral_port.fetch_add(1, Ordering::Relaxed);
-        if port == 0 {
-            self.next_ephemeral_port.store(EPHEMERAL_PORT_START + 1, Ordering::Relaxed);
+        allocate_ephemeral_port_from(&self.next_ephemeral_port)
+    }
+}
+
+/// Atomically pick the next ephemeral port, always staying within
+/// [EPHEMERAL_PORT_START, 65535]. Uses compare_exchange to avoid the
+/// race where `fetch_add` wraps through low-numbered ports (which could
+/// collide with well-known listeners on the same stack).
+fn allocate_ephemeral_port_from(counter: &AtomicU16) -> u16 {
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        // Defensive: coerce anything out of the ephemeral range back in.
+        // Normally current is always in [EPHEMERAL_PORT_START, 65535].
+        let port = if current < EPHEMERAL_PORT_START {
             EPHEMERAL_PORT_START
         } else {
-            port
+            current
+        };
+        let next = if port == u16::MAX {
+            EPHEMERAL_PORT_START
+        } else {
+            port + 1
+        };
+        if counter
+            .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return port;
         }
     }
 }
@@ -618,6 +633,7 @@ async fn writer_task(
     cancel: CancellationToken,
 ) {
     let mut pkt_count = 0u64;
+    let mut err_count = 0u64;
 
     loop {
         tokio::select! {
@@ -627,18 +643,31 @@ async fn writer_task(
                         pkt_count += 1;
 
                         if let Err(e) = conn.write_to(&data, &peer).await {
-                            error!("write_to failed: {}", e);
-                            return;
+                            err_count += 1;
+                            warn!(
+                                "write_to failed ({} total): {} — continuing",
+                                err_count, e
+                            );
+                            // Transient mesh errors (peer unreachable, link drop) must not
+                            // kill the writer — that would silently break every connection
+                            // on this stack. Individual connections will retransmit or
+                            // time out on their own.
                         }
                     }
                     None => {
-                        info!("Writer task: channel closed (sent {} pkts)", pkt_count);
+                        info!(
+                            "Writer task: channel closed (sent {} pkts, {} errs)",
+                            pkt_count, err_count
+                        );
                         return;
                     }
                 }
             }
             _ = cancel.cancelled() => {
-                info!("Writer task cancelled (sent {} pkts)", pkt_count);
+                info!(
+                    "Writer task cancelled (sent {} pkts, {} errs)",
+                    pkt_count, err_count
+                );
                 return;
             }
         }
@@ -729,9 +758,39 @@ mod tests {
         let p2 = stack.allocate_ephemeral_port();
         let p3 = stack.allocate_ephemeral_port();
 
-        // Ports are sequential (starting from a random offset)
+        // All ports are in the ephemeral range
         assert!(p1 >= EPHEMERAL_PORT_START);
-        assert_eq!(p2, p1.wrapping_add(1));
-        assert_eq!(p3, p1.wrapping_add(2));
+        assert!(p2 >= EPHEMERAL_PORT_START);
+        assert!(p3 >= EPHEMERAL_PORT_START);
+
+        // Ports advance by 1, wrapping back to EPHEMERAL_PORT_START after 65535
+        let expected_p2 = if p1 == u16::MAX { EPHEMERAL_PORT_START } else { p1 + 1 };
+        let expected_p3 = if expected_p2 == u16::MAX { EPHEMERAL_PORT_START } else { expected_p2 + 1 };
+        assert_eq!(p2, expected_p2);
+        assert_eq!(p3, expected_p3);
+    }
+
+    #[test]
+    fn test_ephemeral_port_wraparound() {
+        // Start the counter near the top to exercise the wrap path.
+        let counter = AtomicU16::new(65534);
+
+        let p1 = allocate_ephemeral_port_from(&counter);
+        let p2 = allocate_ephemeral_port_from(&counter);
+        let p3 = allocate_ephemeral_port_from(&counter);
+        let p4 = allocate_ephemeral_port_from(&counter);
+
+        assert_eq!(p1, 65534);
+        assert_eq!(p2, 65535);
+        assert_eq!(p3, EPHEMERAL_PORT_START);
+        assert_eq!(p4, EPHEMERAL_PORT_START + 1);
+    }
+
+    #[test]
+    fn test_ephemeral_port_out_of_range_is_coerced() {
+        // If the counter ever holds a low port, allocator still hands out ephemeral ones.
+        let counter = AtomicU16::new(42);
+        let p = allocate_ephemeral_port_from(&counter);
+        assert!(p >= EPHEMERAL_PORT_START);
     }
 }

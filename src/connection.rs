@@ -437,7 +437,7 @@ async fn connection_task(
                     Some(pkt) => {
                         handle_incoming_packet(
                             &inner, &outgoing, &key, &open_notify, pkt,
-                        );
+                        ).await;
                     }
                     None => {
                         // Channel closed — connection dead
@@ -469,6 +469,22 @@ async fn connection_task(
                     g.state = TcpState::Closed;
                     g.wake_all();
                     break;
+                }
+                if state == TcpState::SynReceived {
+                    // Retransmit SYN-ACK until we see the 3rd-leg ACK or the outer
+                    // handshake timeout (manager.rs) aborts us. Without this, a single
+                    // dropped SYN-ACK left the server stuck until the client happened
+                    // to retransmit its SYN.
+                    let syn_ack = Packet::syn_ack(key.local_port, key.remote_port);
+                    if let Ok(data) = syn_ack.encode() {
+                        let _ = outgoing.send((data, key.remote_key)).await;
+                    }
+                    debug!(
+                        "Connection {:?}: retransmitting SYN-ACK (rto={}ms)",
+                        key, rto_ms
+                    );
+                    rto_ms = (rto_ms * 2).min(MAX_RTO_MS);
+                    continue;
                 }
 
                 let current_ack = inner.lock().unwrap().send_ack_seq;
@@ -563,340 +579,322 @@ async fn connection_task(
 }
 
 /// Process a single incoming packet, updating ConnInner state.
-fn handle_incoming_packet(
+///
+/// The sync state machine runs entirely inside an explicit `{ }` scope so that
+/// the MutexGuard is dropped before any `.await`. Handshake-critical packets
+/// (3rd-leg ACK, SYN-ACK retransmit, ACK of retransmitted SYN-ACK) are queued
+/// into `critical_send` and awaited *outside* the locked scope so that
+/// backpressure from a saturated outgoing channel cannot silently drop them.
+/// Non-critical data-path ACKs still use `try_send` — TCP's retransmission
+/// naturally recovers those.
+async fn handle_incoming_packet(
     inner: &Arc<Mutex<ConnInner>>,
     outgoing: &mpsc::Sender<(Vec<u8>, Addr)>,
     key: &ConnKey,
     open_notify: &Arc<Notify>,
     packet: Packet,
 ) {
-    let mut g = inner.lock().unwrap();
+    let mut critical_send: Option<Packet> = None;
+    let mut notify_open = false;
 
-    match g.state {
-        TcpState::SynSent => {
-            // Expecting SYN-ACK
-            if packet.is_syn() && packet.is_ack() {
-                g.send_window = packet.window;
-                g.state = TcpState::Established;
-                g.wake_writer();
-                drop(g);
-                open_notify.notify_waiters();
-                // Send ACK (3rd leg of handshake)
-                let ack = Packet::ack(key.local_port, key.remote_port, 0, DEFAULT_WINDOW_SIZE);
-                if let Ok(data) = ack.encode() {
-                    let _ = outgoing.try_send((data, key.remote_key));
-                }
-                return;
-            }
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                drop(g);
-                open_notify.notify_waiters();
-                return;
-            }
-            return;
-        }
-        TcpState::SynReceived => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                drop(g);
-                open_notify.notify_waiters();
-                return;
-            }
-            // ACK completes 3-way handshake
-            if packet.is_ack() && !packet.is_syn() {
-                g.send_window = packet.window;
-                g.state = TcpState::Established;
-                g.wake_writer();
-                // If packet has data, fall through to data processing
-                if packet.data.is_empty() {
-                    drop(g);
-                    open_notify.notify_waiters();
-                    return;
-                }
-                // Notify open, then process data below
-                open_notify.notify_waiters();
-                // Fall through to Established data processing
-            } else {
-                // Duplicate SYN — resend SYN-ACK
-                drop(g);
-                let syn_ack = Packet::syn_ack(key.local_port, key.remote_port);
-                if let Ok(data) = syn_ack.encode() {
-                    let _ = outgoing.try_send((data, key.remote_key));
-                }
-                return;
-            }
-        }
-        TcpState::Established => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                return;
-            }
-            if packet.is_fin() {
-                g.peer_fin = true;
-                g.state = TcpState::CloseWait;
-                g.wake_reader();
-                g.wake_closer();
-                // Send ACK for FIN
-                let ack = Packet::ack(
-                    key.local_port, key.remote_port,
-                    g.next_recv_seq, g.recv_window,
-                );
-                drop(g);
-                if let Ok(data) = ack.encode() {
-                    let _ = outgoing.try_send((data, key.remote_key));
-                }
-                return;
-            }
-        }
-        TcpState::FinWait1 => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                return;
-            }
-            // Check if peer ACKs our FIN
-            let fin_acked = g.fin_seq.is_some_and(|fs| {
-                let fin_end = fs.wrapping_add(1);
-                packet.is_ack() && packet.ack_seq >= fin_end
-            });
-            if packet.is_fin() && fin_acked {
-                // Simultaneous close with ACK — go to TimeWait
-                g.peer_fin = true;
-                g.state = TcpState::TimeWait;
-                g.wake_closer();
-                let ack = Packet::ack(
-                    key.local_port, key.remote_port,
-                    g.next_recv_seq, g.recv_window,
-                );
-                drop(g);
-                if let Ok(data) = ack.encode() {
-                    let _ = outgoing.try_send((data, key.remote_key));
-                }
-                return;
-            }
-            if packet.is_fin() {
-                // Simultaneous close (no ACK of our FIN yet)
-                g.peer_fin = true;
-                g.state = TcpState::Closing;
-                g.wake_closer();
-                let ack = Packet::ack(
-                    key.local_port, key.remote_port,
-                    g.next_recv_seq, g.recv_window,
-                );
-                drop(g);
-                if let Ok(data) = ack.encode() {
-                    let _ = outgoing.try_send((data, key.remote_key));
-                }
-                return;
-            }
-            if fin_acked {
-                g.state = TcpState::FinWait2;
-                g.wake_closer();
-                // Fall through to process ACK/data
-            }
-        }
-        TcpState::FinWait2 => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                return;
-            }
-            if packet.is_fin() {
-                g.peer_fin = true;
-                g.state = TcpState::TimeWait;
-                g.wake_reader();
-                g.wake_closer();
-                let ack = Packet::ack(
-                    key.local_port, key.remote_port,
-                    g.next_recv_seq, g.recv_window,
-                );
-                drop(g);
-                if let Ok(data) = ack.encode() {
-                    let _ = outgoing.try_send((data, key.remote_key));
-                }
-                return;
-            }
-        }
-        TcpState::CloseWait => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                return;
-            }
-            // Can still process ACKs for data we sent
-        }
-        TcpState::Closing => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                return;
-            }
-            // Waiting for ACK of our FIN
-            let fin_acked = g.fin_seq.is_some_and(|fs| {
-                let fin_end = fs.wrapping_add(1);
-                packet.is_ack() && packet.ack_seq >= fin_end
-            });
-            if fin_acked {
-                g.state = TcpState::TimeWait;
-                g.wake_closer();
-            }
-            return;
-        }
-        TcpState::LastAck => {
-            if packet.is_rst() {
-                g.state = TcpState::Closed;
-                g.wake_all();
-                return;
-            }
-            let fin_acked = g.fin_seq.is_some_and(|fs| {
-                let fin_end = fs.wrapping_add(1);
-                packet.is_ack() && packet.ack_seq >= fin_end
-            });
-            if fin_acked {
-                g.state = TcpState::Closed;
-                g.wake_all();
-            }
-            return;
-        }
-        TcpState::TimeWait | TcpState::Closed | TcpState::Listen => {
-            return;
-        }
-    }
+    {
+        let mut g = inner.lock().unwrap();
 
-    // === ACK processing (for Established, FinWait1, FinWait2, CloseWait) ===
-    if packet.is_ack() {
-        g.send_window = packet.window;
-        let new_ack = packet.ack_seq;
-        let old_ack = g.send_ack_seq;
+        // Track whether the post-match ACK/data processing should run.
+        // Set to true for states that either already are Established/CloseWait/
+        // FinWait1 (→FinWait2)/FinWait2 and received a non-terminal packet.
+        let mut process_ack_and_data = false;
 
-        if new_ack > old_ack {
-            g.send_ack_seq = new_ack;
-
-            // Capture RTT sample from oldest fully-ACKed segment
-            let oldest_sample = g.unacked.front()
-                .filter(|seg| seg.seq.wrapping_add(seg.data.len() as u32) <= new_ack)
-                .map(|seg| (seg.seq, seg.sent_at));
-
-            // Prune ACKed segments
-            while let Some(front) = g.unacked.front() {
-                let seg_end = front.seq.wrapping_add(front.data.len() as u32);
-                if seg_end <= new_ack {
-                    g.unacked.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            // RTT sample (Karn's algorithm)
-            if let Some((seq, sent_at)) = oldest_sample {
-                if !g.rtt.was_retransmitted(seq) {
-                    let sample_us = sent_at.elapsed().as_micros() as u64;
-                    g.rtt.update(sample_us);
-                    trace!("Connection {:?}: RTT {}us, RTO={}ms", key, sample_us, g.rtt.rto());
-                }
-                g.rtt.clear_retransmitted_up_to(new_ack);
-            }
-
-            g.dup_ack_count = 0;
-            g.last_dup_ack = new_ack;
-
-            // Congestion window growth (TCP Reno)
-            let new_cwnd = if g.cwnd < g.ssthresh {
-                g.cwnd + SEND_CHUNK_SIZE as u32
-            } else {
-                g.cwnd + (SEND_CHUNK_SIZE as u32 * SEND_CHUNK_SIZE as u32) / g.cwnd.max(1)
-            };
-            g.cwnd = new_cwnd.min(MAX_INFLIGHT);
-        } else if new_ack == old_ack && old_ack > 0 && packet.data.is_empty() {
-            // Duplicate ACK (standalone ACK only)
-            g.dup_ack_count += 1;
-            if g.dup_ack_count == 3 {
-                // Fast retransmit
-                let half = (g.cwnd / 2).max(SEND_CHUNK_SIZE as u32);
-                g.ssthresh = half;
-                g.cwnd = half;
-
-                let seg = g.unacked.front().map(|s| (s.seq, s.data.clone()));
-                if let Some((seq, data)) = seg {
-                    g.rtt.mark_retransmitted(seq);
-                    let pkt = Packet::data_ack(
-                        key.local_port, key.remote_port,
-                        data, seq, g.next_recv_seq, g.recv_window,
-                    );
-                    drop(g);
-                    if let Ok(encoded) = pkt.encode() {
-                        let _ = outgoing.try_send((encoded, key.remote_key));
-                    }
-                    // Re-lock for wake_writer below
-                    let mut g = inner.lock().unwrap();
+        match g.state {
+            TcpState::SynSent => {
+                if packet.is_syn() && packet.is_ack() {
+                    g.send_window = packet.window;
+                    g.state = TcpState::Established;
                     g.wake_writer();
-                    debug!("Connection {:?}: fast retransmit seq {}", key, seq);
-                    return;
+                    notify_open = true;
+                    // 3rd leg of handshake — await below so we don't drop it
+                    // under backpressure.
+                    critical_send = Some(Packet::ack(
+                        key.local_port, key.remote_port, 0, DEFAULT_WINDOW_SIZE,
+                    ));
+                } else if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                    notify_open = true;
+                }
+            }
+            TcpState::SynReceived => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                    notify_open = true;
+                } else if packet.is_ack() && !packet.is_syn() {
+                    g.send_window = packet.window;
+                    g.state = TcpState::Established;
+                    g.wake_writer();
+                    notify_open = true;
+                    if !packet.data.is_empty() {
+                        // Piggy-backed data on the 3rd-leg ACK.
+                        process_ack_and_data = true;
+                    }
+                } else {
+                    // Duplicate SYN — resend SYN-ACK with backpressure.
+                    critical_send = Some(Packet::syn_ack(
+                        key.local_port, key.remote_port,
+                    ));
+                }
+            }
+            TcpState::Established => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                } else if packet.is_syn() && packet.is_ack() {
+                    // Retransmitted SYN-ACK — our 3rd-leg ACK was lost. Resend it.
+                    critical_send = Some(Packet::ack(
+                        key.local_port, key.remote_port, 0, DEFAULT_WINDOW_SIZE,
+                    ));
+                } else if packet.is_fin() {
+                    g.peer_fin = true;
+                    g.state = TcpState::CloseWait;
+                    g.wake_reader();
+                    g.wake_closer();
+                    let ack = Packet::ack(
+                        key.local_port, key.remote_port,
+                        g.next_recv_seq, g.recv_window,
+                    );
+                    if let Ok(data) = ack.encode() {
+                        let _ = outgoing.try_send((data, key.remote_key));
+                    }
+                } else {
+                    process_ack_and_data = true;
+                }
+            }
+            TcpState::FinWait1 => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                } else {
+                    let fin_acked = g.fin_seq.is_some_and(|fs| {
+                        let fin_end = fs.wrapping_add(1);
+                        packet.is_ack() && packet.ack_seq >= fin_end
+                    });
+                    if packet.is_fin() && fin_acked {
+                        g.peer_fin = true;
+                        g.state = TcpState::TimeWait;
+                        g.wake_closer();
+                        let ack = Packet::ack(
+                            key.local_port, key.remote_port,
+                            g.next_recv_seq, g.recv_window,
+                        );
+                        if let Ok(data) = ack.encode() {
+                            let _ = outgoing.try_send((data, key.remote_key));
+                        }
+                    } else if packet.is_fin() {
+                        g.peer_fin = true;
+                        g.state = TcpState::Closing;
+                        g.wake_closer();
+                        let ack = Packet::ack(
+                            key.local_port, key.remote_port,
+                            g.next_recv_seq, g.recv_window,
+                        );
+                        if let Ok(data) = ack.encode() {
+                            let _ = outgoing.try_send((data, key.remote_key));
+                        }
+                    } else {
+                        if fin_acked {
+                            g.state = TcpState::FinWait2;
+                            g.wake_closer();
+                        }
+                        process_ack_and_data = true;
+                    }
+                }
+            }
+            TcpState::FinWait2 => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                } else if packet.is_fin() {
+                    g.peer_fin = true;
+                    g.state = TcpState::TimeWait;
+                    g.wake_reader();
+                    g.wake_closer();
+                    let ack = Packet::ack(
+                        key.local_port, key.remote_port,
+                        g.next_recv_seq, g.recv_window,
+                    );
+                    if let Ok(data) = ack.encode() {
+                        let _ = outgoing.try_send((data, key.remote_key));
+                    }
+                } else {
+                    process_ack_and_data = true;
+                }
+            }
+            TcpState::CloseWait => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                } else {
+                    process_ack_and_data = true;
+                }
+            }
+            TcpState::Closing => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                } else {
+                    let fin_acked = g.fin_seq.is_some_and(|fs| {
+                        let fin_end = fs.wrapping_add(1);
+                        packet.is_ack() && packet.ack_seq >= fin_end
+                    });
+                    if fin_acked {
+                        g.state = TcpState::TimeWait;
+                        g.wake_closer();
+                    }
+                }
+            }
+            TcpState::LastAck => {
+                if packet.is_rst() {
+                    g.state = TcpState::Closed;
+                    g.wake_all();
+                } else {
+                    let fin_acked = g.fin_seq.is_some_and(|fs| {
+                        let fin_end = fs.wrapping_add(1);
+                        packet.is_ack() && packet.ack_seq >= fin_end
+                    });
+                    if fin_acked {
+                        g.state = TcpState::Closed;
+                        g.wake_all();
+                    }
+                }
+            }
+            TcpState::TimeWait | TcpState::Closed | TcpState::Listen => {}
+        }
+
+        if process_ack_and_data {
+            // === ACK processing ===
+            if packet.is_ack() {
+                g.send_window = packet.window;
+                let new_ack = packet.ack_seq;
+                let old_ack = g.send_ack_seq;
+
+                if new_ack > old_ack {
+                    g.send_ack_seq = new_ack;
+
+                    let oldest_sample = g.unacked.front()
+                        .filter(|seg| seg.seq.wrapping_add(seg.data.len() as u32) <= new_ack)
+                        .map(|seg| (seg.seq, seg.sent_at));
+
+                    while let Some(front) = g.unacked.front() {
+                        let seg_end = front.seq.wrapping_add(front.data.len() as u32);
+                        if seg_end <= new_ack {
+                            g.unacked.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if let Some((seq, sent_at)) = oldest_sample {
+                        if !g.rtt.was_retransmitted(seq) {
+                            let sample_us = sent_at.elapsed().as_micros() as u64;
+                            g.rtt.update(sample_us);
+                            trace!("Connection {:?}: RTT {}us, RTO={}ms", key, sample_us, g.rtt.rto());
+                        }
+                        g.rtt.clear_retransmitted_up_to(new_ack);
+                    }
+
+                    g.dup_ack_count = 0;
+                    g.last_dup_ack = new_ack;
+
+                    let new_cwnd = if g.cwnd < g.ssthresh {
+                        g.cwnd + SEND_CHUNK_SIZE as u32
+                    } else {
+                        g.cwnd + (SEND_CHUNK_SIZE as u32 * SEND_CHUNK_SIZE as u32) / g.cwnd.max(1)
+                    };
+                    g.cwnd = new_cwnd.min(MAX_INFLIGHT);
+                } else if new_ack == old_ack && old_ack > 0 && packet.data.is_empty() {
+                    g.dup_ack_count += 1;
+                    if g.dup_ack_count == 3 {
+                        let half = (g.cwnd / 2).max(SEND_CHUNK_SIZE as u32);
+                        g.ssthresh = half;
+                        g.cwnd = half;
+
+                        let seg = g.unacked.front().map(|s| (s.seq, s.data.clone()));
+                        if let Some((seq, data)) = seg {
+                            g.rtt.mark_retransmitted(seq);
+                            let pkt = Packet::data_ack(
+                                key.local_port, key.remote_port,
+                                data, seq, g.next_recv_seq, g.recv_window,
+                            );
+                            if let Ok(encoded) = pkt.encode() {
+                                let _ = outgoing.try_send((encoded, key.remote_key));
+                            }
+                            g.wake_writer();
+                            debug!("Connection {:?}: fast retransmit seq {}", key, seq);
+                        }
+                    }
+                }
+                g.wake_writer();
+            }
+
+            // === Data delivery ===
+            if !packet.data.is_empty() {
+                let expected = g.next_recv_seq;
+                let pkt_seq = packet.seq;
+
+                if pkt_seq == expected {
+                    let data_len = packet.data.len() as u32;
+                    g.recv_buf.extend(&packet.data);
+                    let mut next_seq = expected.wrapping_add(data_len);
+
+                    while let Some(data) = g.ooo_buf.remove(&next_seq) {
+                        let len = data.len() as u32;
+                        g.recv_buf.extend(&data);
+                        next_seq = next_seq.wrapping_add(len);
+                    }
+
+                    g.next_recv_seq = next_seq;
+                    g.recv_window = DEFAULT_WINDOW_SIZE.saturating_sub(g.recv_buf.len() as u32);
+                    g.wake_reader();
+
+                    let ack = Packet::ack(
+                        key.local_port, key.remote_port,
+                        g.next_recv_seq, g.recv_window,
+                    );
+                    if let Ok(data) = ack.encode() {
+                        let _ = outgoing.try_send((data, key.remote_key));
+                    }
+                } else if pkt_seq > expected {
+                    if g.ooo_buf.len() < 64 {
+                        g.ooo_buf.insert(pkt_seq, packet.data);
+                    }
+                    trace!("Connection {:?}: OOO expected {}, got {}", key, expected, pkt_seq);
+                    let ack = Packet::ack(
+                        key.local_port, key.remote_port,
+                        g.next_recv_seq, g.recv_window,
+                    );
+                    if let Ok(data) = ack.encode() {
+                        let _ = outgoing.try_send((data, key.remote_key));
+                    }
+                } else {
+                    let ack = Packet::ack(
+                        key.local_port, key.remote_port,
+                        g.next_recv_seq, g.recv_window,
+                    );
+                    if let Ok(data) = ack.encode() {
+                        let _ = outgoing.try_send((data, key.remote_key));
+                    }
                 }
             }
         }
-        g.wake_writer();
+    } // guard dropped here — all .await points are below this line
+
+    if notify_open {
+        open_notify.notify_waiters();
     }
 
-    // === Data delivery ===
-    if !packet.data.is_empty() {
-        let expected = g.next_recv_seq;
-        let pkt_seq = packet.seq;
-
-        if pkt_seq == expected {
-            let data_len = packet.data.len() as u32;
-            g.recv_buf.extend(&packet.data);
-            let mut next_seq = expected.wrapping_add(data_len);
-
-            // Drain consecutive OOO packets
-            while let Some(data) = g.ooo_buf.remove(&next_seq) {
-                let len = data.len() as u32;
-                g.recv_buf.extend(&data);
-                next_seq = next_seq.wrapping_add(len);
-            }
-
-            g.next_recv_seq = next_seq;
-            g.recv_window = DEFAULT_WINDOW_SIZE.saturating_sub(g.recv_buf.len() as u32);
-            g.wake_reader();
-
-            // Send ACK
-            let ack = Packet::ack(
-                key.local_port, key.remote_port,
-                g.next_recv_seq, g.recv_window,
-            );
-            drop(g);
-            if let Ok(data) = ack.encode() {
-                let _ = outgoing.try_send((data, key.remote_key));
-            }
-        } else if pkt_seq > expected {
-            // Out-of-order
-            if g.ooo_buf.len() < 64 {
-                g.ooo_buf.insert(pkt_seq, packet.data);
-            }
-            trace!("Connection {:?}: OOO expected {}, got {}", key, expected, pkt_seq);
-            // Send dup-ACK
-            let ack = Packet::ack(
-                key.local_port, key.remote_port,
-                g.next_recv_seq, g.recv_window,
-            );
-            drop(g);
-            if let Ok(data) = ack.encode() {
-                let _ = outgoing.try_send((data, key.remote_key));
-            }
-        } else {
-            // Old/duplicate data — send ACK anyway
-            let ack = Packet::ack(
-                key.local_port, key.remote_port,
-                g.next_recv_seq, g.recv_window,
-            );
-            drop(g);
-            if let Ok(data) = ack.encode() {
-                let _ = outgoing.try_send((data, key.remote_key));
-            }
+    if let Some(pkt) = critical_send {
+        if let Ok(data) = pkt.encode() {
+            let _ = outgoing.send((data, key.remote_key)).await;
         }
     }
 }

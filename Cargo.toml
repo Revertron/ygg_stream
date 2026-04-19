@@ -1,6 +1,6 @@
 [package]
 name = "ygg_stream"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 authors = ["Revertron"]
 description = "Stream multiplexing library for Yggdrasil mesh network"
@@ -8,7 +8,7 @@ license = "MPL-2.0"
 
 [dependencies]
 ironwood = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "32a0cb5b" }
-yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "32a0cb5b"  }
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "32a0cb5b", default-features = false  }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "codec"] }
 bytes = "1"
